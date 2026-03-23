@@ -1,0 +1,19 @@
+# Jellyfin Media Copy Configuration
+# Copy this file to config.yaml and fill in your values
+
+pi:
+  host: "192.168.1.100"      # Raspberry Pi IP address
+  user: "pi"                  # SSH username
+  # Use either password or key_path (key_path is more secure)
+  password: null              # SSH password (null if using key)
+  key_path: "~/.ssh/id_rsa"   # SSH private key path (null if using password)
+  port: 22                    # SSH port
+
+paths:
+  downloads: "/home/pi/downloads"           # qBittorrent download directory
+  jellyfin_tv: "/home/pi/jellyfin/tvshows"  # Jellyfin TV shows directory
+
+options:
+  dry_run: false              # Set to true to preview without copying
+  bwlimit: null               # Bandwidth limit in KB/s (null for unlimited)
+  preserve_permissions: true  # Preserve file permissions with rsync
