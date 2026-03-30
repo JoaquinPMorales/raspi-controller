@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Jellyfin Media Copy Script
-Scans TV series from qBittorrent downloads and copies them to Jellyfin via rsync over SSH.
+Scans TV series and movies from qBittorrent downloads and copies them to Jellyfin.
+Supports two modes:
+1. Internal: Move files within the Raspberry Pi (downloads → Jellyfin library)
+2. External: Copy files from Raspberry Pi to local laptop
 """
 
 import os
@@ -17,7 +20,8 @@ from rich.text import Text
 
 import inquirer
 from scanner import FolderScanner
-from copier import RsyncCopier
+from copier import RsyncCopier, ExternalCopier
+from jellyfin import refresh_jellyfin_library
 
 console = Console()
 
@@ -163,16 +167,37 @@ def select_content(tv_shows: dict, movies: dict) -> list:
         return []
 
 
-def confirm_operation(selected: list, dry_run: bool) -> bool:
+def select_mode() -> str:
+    """Ask user to select operation mode."""
+    questions = [
+        inquirer.List('mode',
+                     message="Select operation mode",
+                     choices=[
+                         ('Internal - Move files within Pi (downloads → Jellyfin)', 'internal'),
+                         ('External - Copy files from Pi to this laptop', 'external'),
+                     ],
+                     default='internal')
+    ]
+    
+    try:
+        answers = inquirer.prompt(questions)
+        return answers['mode'] if answers else 'internal'
+    except KeyboardInterrupt:
+        return 'internal'
+
+
+def confirm_operation(selected: list, dry_run: bool, mode: str) -> bool:
     """Confirm the copy operation with the user."""
     total_items = sum(len(s['items']) for s in selected)
     tv_count = sum(1 for s in selected if s['content_type'] == 'tv')
     movie_count = sum(1 for s in selected if s['content_type'] == 'movie')
     
+    mode_str = "INTERNAL (Pi → Pi)" if mode == 'internal' else "EXTERNAL (Pi → Laptop)"
+    
     if dry_run:
-        mode_text = "[bold yellow]DRY RUN MODE[/bold yellow]"
+        mode_text = f"[bold yellow]DRY RUN MODE - {mode_str}[/bold yellow]"
     else:
-        mode_text = "[bold red]LIVE COPY MODE[/bold red]"
+        mode_text = f"[bold red]LIVE MODE - {mode_str}[/bold red]"
     
     console.print(Panel.fit(
         f"{mode_text}\n"
@@ -186,7 +211,10 @@ def confirm_operation(selected: list, dry_run: bool) -> bool:
     if dry_run:
         console.print("[yellow]This will show what would be copied without actually copying.[/yellow]")
     else:
-        console.print("[red]This will COPY files to your Jellyfin library.[/red]")
+        if mode == 'internal':
+            console.print("[red]This will COPY files within the Pi to your Jellyfin library.[/red]")
+        else:
+            console.print("[red]This will COPY files from Pi to your local laptop.[/red]")
     
     try:
         confirm = inquirer.prompt([
@@ -201,9 +229,13 @@ def main():
     """Main entry point."""
     console.print(Panel.fit(
         "[bold blue]Jellyfin Media Copy[/bold blue]\n"
-        "Copy TV series and movies from qBittorrent to Jellyfin via rsync over SSH",
+        "Copy TV series and movies from qBittorrent to Jellyfin or local machine",
         title="Welcome"
     ))
+    
+    # Select operation mode
+    mode = select_mode()
+    console.print(f"\n[blue]Mode selected: {mode.upper()}[/blue]")
     
     # Load configuration
     config = load_config()
@@ -245,13 +277,20 @@ def main():
     
     # Confirm operation
     dry_run = config['options'].get('dry_run', False)
-    if not confirm_operation(selected, dry_run):
+    if not confirm_operation(selected, dry_run, mode):
         console.print("[yellow]Operation cancelled.[/yellow]")
         scanner.close()
         sys.exit(0)
     
-    # Perform copy
-    copier = RsyncCopier(config['pi'], config['paths'], config['options'])
+    # Perform copy based on mode
+    if mode == 'internal':
+        copier = RsyncCopier(config['pi'], config['paths'], config['options'])
+    else:
+        # External mode - copy to local laptop
+        local_paths = {
+            'local_destination': config['paths'].get('local_destination', './downloads')
+        }
+        copier = ExternalCopier(config['pi'], local_paths, config['options'])
     
     def signal_handler(sig, frame):
         console.print("\n[yellow]Interrupted by user. Cleaning up...[/yellow]")
@@ -265,6 +304,22 @@ def main():
         success = copier.copy_items(selected, console)
         if success:
             console.print("\n[green bold]All operations completed successfully![/green bold]")
+            
+            # Refresh Jellyfin library if internal mode and not dry_run
+            if mode == 'internal' and not dry_run:
+                console.print("\n[blue]Refreshing Jellyfin library...[/blue]")
+                jellyfin_config = config.get('jellyfin', {})
+                refresh_success = refresh_jellyfin_library(
+                    host=jellyfin_config.get('host', config['pi']['host']),
+                    port=jellyfin_config.get('port', 8096),
+                    api_key=jellyfin_config.get('api_key'),
+                    scanner=scanner
+                )
+                if refresh_success:
+                    console.print("[green]Jellyfin library refresh triggered successfully![/green]")
+                else:
+                    console.print("[yellow]Could not refresh Jellyfin library automatically.[/yellow]")
+                    console.print("[dim]You may need to refresh manually in Jellyfin web interface.[/dim]")
         else:
             console.print("\n[red bold]Some operations failed. Check the output above.[/red bold]")
     except Exception as e:

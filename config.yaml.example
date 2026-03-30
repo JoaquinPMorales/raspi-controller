@@ -10,10 +10,18 @@ pi:
   port: 22                    # SSH port
 
 paths:
-  downloads: "/home/pi/downloads"           # qBittorrent download directory
-  jellyfin_tv: "/home/pi/jellyfin/tvshows"  # Jellyfin TV shows directory
+  downloads: "/mnt/storage/downloads"           # qBittorrent download directory
+  jellyfin_shows: "/mnt/media/Shows"           # Jellyfin TV shows directory
+  jellyfin_movies: "/mnt/media/Movies"         # Jellyfin movies directory
+  local_destination: "./downloads"              # Local destination for external copy mode (Pi → Laptop)
 
 options:
   dry_run: false              # Set to true to preview without copying
   bwlimit: null               # Bandwidth limit in KB/s (null for unlimited)
   preserve_permissions: true  # Preserve file permissions with rsync
+
+jellyfin:
+  host: "192.168.1.174"       # Jellyfin server host (usually same as Pi)
+  port: 8096                  # Jellyfin web interface port
+  api_key: null               # Jellyfin API key for library refresh (optional)
+                              # Get from Jellyfin: Dashboard → Advanced → API Keys
