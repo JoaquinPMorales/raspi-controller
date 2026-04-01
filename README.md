@@ -279,6 +279,103 @@ The script detects content type based on file/folder names:
 - Use wired connection instead of WiFi
 - For external mode, consider compression with rsync flags
 
+## Telegram Bot (Control from Your Phone)
+
+Run the Telegram bot on your Raspberry Pi to manage media operations from anywhere using your phone.
+
+### Setup
+
+1. **Get a bot token from Telegram:**
+   - Message [@BotFather](https://t.me/botfather) on Telegram
+   - Send `/newbot` and follow instructions
+   - Copy the bot token (looks like `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
+
+2. **Add the token to your config:**
+   ```yaml
+   telegram:
+     token: "YOUR_BOT_TOKEN_HERE"
+     allowed_users: []  # Leave empty to allow all, or add your user ID for security
+   ```
+
+3. **Get your Telegram user ID (optional, for security):**
+   - Message [@userinfobot](https://t.me/userinfobot)
+   - Copy your ID number
+   - Add it to `allowed_users: [123456789]` in config
+
+4. **Run the bot on your Raspberry Pi:**
+   ```bash
+   # SSH into your Pi first, then:
+   cd ~/jellyfin-copy
+   source venv/bin/activate
+   python telegram_bot.py
+   ```
+
+5. **Start the bot on your phone:**
+   - Open Telegram, find your bot
+   - Send `/start`
+   - Select mode: 📁 Internal, 💻 External, or 🔧 Maintenance
+
+### Using the Bot
+
+The bot provides an interactive menu:
+
+1. **Select Mode** - Choose what operation to perform
+2. **Select Content** - Tap items to select/deselect (☑/⬜)
+3. **Confirm** - Review disk space requirements
+4. **Execute** - Copy or update begins, progress updates sent
+
+**Security Note:** The bot only accepts commands from authorized users. If `allowed_users` is empty, anyone with the bot link can use it. For security, always set your user ID.
+
+### Running the Bot as a Service (Auto-start on boot)
+
+Create a systemd service so the bot runs automatically using your virtual environment:
+
+```bash
+# Adjust these paths to match your setup:
+PROJECT_DIR="/home/pi/jellyfin-copy"  # Where you cloned the repo
+USER="pi"                              # Your Pi username
+
+# Create service file
+sudo tee /etc/systemd/system/jellyfin-bot.service << EOF
+[Unit]
+Description=Jellyfin Media Copy Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$PROJECT_DIR
+Environment=PATH=$PROJECT_DIR/venv/bin
+ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/telegram_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable and start the service
+sudo systemctl daemon-reload
+sudo systemctl enable jellyfin-bot
+sudo systemctl start jellyfin-bot
+
+# Check status
+sudo systemctl status jellyfin-bot
+
+# View logs (if needed)
+sudo journalctl -u jellyfin-bot -f
+```
+
+**To stop the service:**
+```bash
+sudo systemctl stop jellyfin-bot
+```
+
+**To restart after config changes:**
+```bash
+sudo systemctl restart jellyfin-bot
+```
+
 ## Safety Features
 
 - **Dry-Run Mode**: Set `dry_run: true` to preview without copying

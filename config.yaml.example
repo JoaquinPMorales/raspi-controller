@@ -26,3 +26,10 @@ jellyfin:
   port: 8096                  # Jellyfin web interface port
   api_key: null               # Jellyfin API key for library refresh (optional)
                               # Get from Jellyfin: Dashboard → Advanced → API Keys
+
+# Telegram Bot Configuration (optional)
+# Run the bot on your Pi with: python telegram_bot.py
+telegram:
+  token: "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather on Telegram
+  allowed_users: []             # List of allowed Telegram user IDs (empty = allow all)
+                                # Use /start to see your user ID if unauthorized
