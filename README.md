@@ -326,6 +326,25 @@ The bot provides an interactive menu:
 
 **Security Note:** The bot only accepts commands from authorized users. If `allowed_users` is empty, anyone with the bot link can use it. For security, always set your user ID.
 
+### Available Commands
+
+Type `/` in Telegram to see the command menu, or use any of these:
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Start media copy operation (opens interactive menu) |
+| `/status` | Check disk space on all mounted volumes |
+| `/health` | Check disk health with SMART data (temperature, wear %, power-on hours) |
+| `/services` | Check if Jellyfin, qBittorrent, Plex, and Samba are running |
+| `/reboot` | Reboot the Pi remotely (requires confirmation) |
+| `/help` | Show all available commands and usage tips |
+| `/cancel` | Cancel current operation |
+
+**Tips:**
+- Use `/health` regularly to monitor drive wear on SSDs
+- `/services` is useful when Jellyfin isn't responding — check if it crashed
+- `/reboot` shows confirmation buttons to prevent accidental restarts during active copies
+
 ### Running the Bot as a Service (Auto-start on boot)
 
 Create a systemd service so the bot runs automatically using your virtual environment:
