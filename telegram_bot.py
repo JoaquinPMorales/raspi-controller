@@ -609,7 +609,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/status - Check disk space on Pi\n"
         "/health - Check disk health (SMART)\n"
         "/services - Check Jellyfin/qBittorrent status\n"
-        "/downloads - Show qBittorrent download status\n"
+        "/downloads - Show active downloads\n"
+        "/pause - Pause all downloads\n"
+        "/speed - Run internet speed test\n"
+        "/search - Search media in library (e.g. /search Batman)\n"
+        "/notify - Toggle download finish alerts\n"
         "/reboot - Reboot the Pi\n"
         "/cancel - Cancel current operation\n\n"
         "How to use:\n"
@@ -1041,8 +1045,8 @@ async def downloads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show disk space status."""
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pause all active qBittorrent downloads."""
     config = context.bot_data.get('config')
     allowed_users = config.get('telegram', {}).get('allowed_users', [])
     user_id = update.effective_user.id
@@ -1051,33 +1055,169 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⛔ Unauthorized.")
         return
     
-    await update.message.reply_text("🔍 Checking disk space...")
-    
-    from scanner import FolderScanner
-    scanner = FolderScanner(config['pi'])
-    
-    if not scanner.connect():
-        await update.message.reply_text("❌ Failed to connect to Pi.")
+    qb_config = config.get('qbittorrent', {})
+    if not qb_config.get('host') or not qb_config.get('password'):
+        await update.message.reply_text("⚠️ qBittorrent not configured.")
         return
     
+    await update.message.reply_text("⏸️ Pausing downloads...")
+    
     try:
-        downloads = config['paths']['downloads']
-        shows = config['paths'].get('jellyfin_shows', '/mnt/media/Shows')
-        movies = config['paths'].get('jellyfin_movies', '/mnt/media/Movies')
+        base_url = f"http://{qb_config['host']}:{qb_config.get('port', 8080)}/api/v2"
         
-        dl_space = scanner.get_disk_space(downloads)
-        shows_space = scanner.get_disk_space(shows)
-        movies_space = scanner.get_disk_space(movies)
-        
-        status_text = (
-            "📊 *Disk Space Status*\n\n"
-            f"*Downloads:* {format_size(dl_space['available'])} free\n"
-            f"*Shows:* {format_size(shows_space['available'])} free\n"
-            f"*Movies:* {format_size(movies_space['available'])} free"
+        async with httpx.AsyncClient(timeout=10) as client:
+            login_resp = await client.post(
+                f"{base_url}/auth/login",
+                data={'username': qb_config['username'], 'password': qb_config['password']}
+            )
+            
+            if login_resp.status_code != 200 or login_resp.text != 'Ok.':
+                await update.message.reply_text("❌ Failed to connect to qBittorrent.")
+                return
+            
+            await client.post(f"{base_url}/torrents/pause", data={'hashes': 'all'})
+            
+        await update.message.reply_text("✅ All downloads paused.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
+
+
+async def speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run internet speed test on the Pi."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    await update.message.reply_text("🌐 Running speed test (30-60s)...")
+    
+    import paramiko
+    pi_config = config['pi']
+    
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            pi_config['host'],
+            port=pi_config.get('port', 22),
+            username=pi_config['user'],
+            password=pi_config.get('password'),
+            key_filename=pi_config.get('key_path')
         )
-        await update.message.reply_text(status_text, parse_mode='Markdown')
-    finally:
-        scanner.close()
+        
+        stdin, stdout, _ = ssh.exec_command('which speedtest-cli || echo "not_installed"')
+        check = stdout.read().decode().strip()
+        
+        if 'not_installed' in check:
+            await update.message.reply_text("📦 Installing speedtest-cli first...")
+            ssh.exec_command('sudo apt update && sudo apt install -y speedtest-cli')
+        
+        stdin, stdout, stderr = ssh.exec_command('speedtest-cli --simple', timeout=90)
+        output = stdout.read().decode().strip()
+        
+        ssh.close()
+        
+        if output:
+            lines = output.splitlines()
+            result = "🚀 *Speed Test Results*\n\n"
+            for line in lines:
+                if 'Ping' in line:
+                    result += f"📍 {line}\n"
+                elif 'Download' in line:
+                    result += f"⬇️ {line}\n"
+                elif 'Upload' in line:
+                    result += f"⬆️ {line}\n"
+            await update.message.reply_text(result, parse_mode='Markdown')
+        else:
+            await update.message.reply_text("❌ Speed test failed. Try installing manually: `sudo apt install speedtest-cli`")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search for media in Jellyfin library."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("🔍 Usage: `/search <movie or show name>`")
+        return
+    
+    query = ' '.join(context.args).lower()
+    await update.message.reply_text(f"🔍 Searching for '*{query}*'...", parse_mode='Markdown')
+    
+    import paramiko
+    pi_config = config['pi']
+    
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            pi_config['host'],
+            port=pi_config.get('port', 22),
+            username=pi_config['user'],
+            password=pi_config.get('password'),
+            key_filename=pi_config.get('key_path')
+        )
+        
+        shows_path = config['paths'].get('jellyfin_shows', '/mnt/media/Shows')
+        movies_path = config['paths'].get('jellyfin_movies', '/mnt/media/Movies')
+        
+        results = []
+        
+        stdin, stdout, _ = ssh.exec_command(f'find {shows_path} -maxdepth 2 -type d -iname "*{query}*" 2>/dev/null | head -5')
+        shows_found = stdout.read().decode().strip().splitlines()
+        for show in shows_found:
+            if show:
+                results.append(f"📺 {show.split('/')[-1]}")
+        
+        stdin, stdout, _ = ssh.exec_command(f'find {movies_path} -maxdepth 2 -type f -iname "*{query}*" 2>/dev/null | head -5')
+        movies_found = stdout.read().decode().strip().splitlines()
+        for movie in movies_found:
+            if movie:
+                results.append(f"🎬 {movie.split('/')[-1].rsplit('.', 1)[0]}")
+        
+        ssh.close()
+        
+        if results:
+            result_text = f"✅ *Found in library:*\n\n" + "\n".join(results[:10])
+            if len(results) > 10:
+                result_text += f"\n\n... and {len(results) - 10} more"
+        else:
+            result_text = f"❌ '*{query}*' not found in library"
+        
+        await update.message.reply_text(result_text, parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
+
+
+async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle download completion notifications."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    current = user_data.get(user_id, {}).get('notifications', False)
+    new_setting = not current
+    
+    if user_id not in user_data:
+        user_data[user_id] = {}
+    user_data[user_id]['notifications'] = new_setting
+    
+    status = "✅ enabled" if new_setting else "❌ disabled"
+    await update.message.reply_text(f"🔔 Notifications {status}. You'll get alerts when downloads finish.")
 
 
 def main():
@@ -1104,6 +1244,10 @@ def main():
             BotCommand('health', 'Check disk health (SMART)'),
             BotCommand('services', 'Check Jellyfin/qBittorrent status'),
             BotCommand('downloads', 'Show qBittorrent download status'),
+            BotCommand('pause', 'Pause all downloads'),
+            BotCommand('speed', 'Run internet speed test'),
+            BotCommand('search', 'Search media in library'),
+            BotCommand('notify', 'Toggle download alerts'),
             BotCommand('reboot', 'Reboot the Pi'),
             BotCommand('cancel', 'Cancel current operation'),
         ])
@@ -1140,6 +1284,10 @@ def main():
             CommandHandler('health', health_command),
             CommandHandler('services', services_command),
             CommandHandler('downloads', downloads_command),
+            CommandHandler('pause', pause_command),
+            CommandHandler('speed', speed_command),
+            CommandHandler('search', search_command),
+            CommandHandler('notify', notify_command),
             CommandHandler('reboot', reboot_command),
             CallbackQueryHandler(reboot_callback, pattern='^reboot_'),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
@@ -1152,11 +1300,15 @@ def main():
     application.add_handler(CommandHandler('health', health_command))
     application.add_handler(CommandHandler('services', services_command))
     application.add_handler(CommandHandler('downloads', downloads_command))
+    application.add_handler(CommandHandler('pause', pause_command))
+    application.add_handler(CommandHandler('speed', speed_command))
+    application.add_handler(CommandHandler('search', search_command))
+    application.add_handler(CommandHandler('notify', notify_command))
     application.add_handler(CommandHandler('reboot', reboot_command))
     
     # Run the bot
     print("Starting Telegram bot...")
-    print("Available commands: /start, /help, /status, /health, /services, /downloads, /reboot, /cancel")
+    print("Available commands: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /notify, /reboot, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
