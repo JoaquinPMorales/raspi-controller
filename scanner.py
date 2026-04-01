@@ -59,6 +59,63 @@ class FolderScanner:
         if self.ssh:
             self.ssh.close()
     
+    def get_disk_space(self, path: str) -> dict:
+        """Get disk space information for a path (returns bytes)."""
+        try:
+            # Use df command to get disk space
+            stdin, stdout, stderr = self.ssh.exec_command(f'df -B1 "{path}" 2>/dev/null | tail -1')
+            output = stdout.read().decode().strip()
+            
+            if output:
+                parts = output.split()
+                if len(parts) >= 4:
+                    return {
+                        'total': int(parts[1]),
+                        'used': int(parts[2]),
+                        'free': int(parts[3]),
+                        'available': int(parts[3])
+                    }
+            
+            # Fallback to statvfs via Python on remote
+            stdin, stdout, stderr = self.ssh.exec_command(
+                f'python3 -c "import os; s=os.statvfs(\"{path}\"); print(s.f_frsize*s.f_blocks, s.f_frsize*s.f_bfree, s.f_frsize*s.f_bavail)" 2>/dev/null'
+            )
+            output = stdout.read().decode().strip()
+            if output:
+                parts = output.split()
+                if len(parts) >= 3:
+                    return {
+                        'total': int(parts[0]),
+                        'used': int(parts[0]) - int(parts[1]),
+                        'free': int(parts[1]),
+                        'available': int(parts[2])
+                    }
+        except Exception:
+            pass
+        
+        return {'total': 0, 'used': 0, 'free': 0, 'available': 0}
+    
+    def get_item_size(self, path: str) -> int:
+        """Get total size of a file or directory in bytes."""
+        try:
+            # Use du command for accurate directory size
+            stdin, stdout, stderr = self.ssh.exec_command(f'du -sb "{path}" 2>/dev/null | cut -f1')
+            output = stdout.read().decode().strip()
+            if output and output.isdigit():
+                return int(output)
+        except Exception:
+            pass
+        return 0
+    
+    def calculate_items_size(self, items: list) -> int:
+        """Calculate total size of multiple items."""
+        total_size = 0
+        for item in items:
+            item_list = item.get('items', [item])
+            for sub_item in item_list:
+                total_size += self.get_item_size(sub_item['path'])
+        return total_size
+    
     def scan_folder(self, path: str) -> List[Dict]:
         """
         Scan a folder and return list of items with metadata.

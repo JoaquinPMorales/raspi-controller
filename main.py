@@ -28,6 +28,18 @@ from updater import SystemUpdater
 console = Console()
 
 
+def format_size(size_bytes: int) -> str:
+    """Format bytes to human readable string."""
+    if size_bytes == 0:
+        return "0 B"
+    size_names = ["B", "KB", "MB", "GB", "TB"]
+    import math
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return f"{s} {size_names[i]}"
+
+
 def load_config(config_path: str = "config.yaml") -> dict:
     """Load configuration from YAML file."""
     if not os.path.exists(config_path):
@@ -163,9 +175,13 @@ def select_content(tv_shows: dict, movies: dict) -> list:
         console.print("[yellow]No content found in downloads directory.[/yellow]")
         return []
     
+    # Clear screen to prevent checkbox redraw issues
+    console.clear()
+    console.print(f"[dim]Found {len(choices)} item(s) - use space to select, enter to confirm[/dim]\n")
+    
     questions = [
         inquirer.Checkbox('selected',
-                         message="Select content to copy (space to select, enter to confirm)",
+                         message="Select content to copy",
                          choices=choices,
                          carousel=True)
     ]
@@ -201,11 +217,37 @@ def select_mode() -> str:
         return 'internal'
 
 
-def confirm_operation(selected: list, dry_run: bool, mode: str) -> bool:
-    """Confirm the copy operation with the user."""
+def confirm_operation(selected: list, dry_run: bool, mode: str, scanner, config: dict) -> bool:
+    """Confirm the copy operation with the user, including disk space check."""
     total_items = sum(len(s['items']) for s in selected)
     tv_count = sum(1 for s in selected if s['content_type'] == 'tv')
     movie_count = sum(1 for s in selected if s['content_type'] == 'movie')
+    
+    # Calculate total size of selected items
+    console.print("[dim]Calculating size of selected items...[/dim]")
+    total_size = scanner.calculate_items_size(selected)
+    
+    # Get destination disk space
+    if mode == 'internal':
+        # Check both Shows and Movies directories
+        shows_path = config['paths'].get('jellyfin_shows', '/mnt/media/Shows')
+        movies_path = config['paths'].get('jellyfin_movies', '/mnt/media/Movies')
+        shows_space = scanner.get_disk_space(shows_path)
+        movies_space = scanner.get_disk_space(movies_path)
+        # Use the minimum available space
+        dest_free = min(shows_space['available'], movies_space['available'])
+        dest_path = f"{shows_path} / {movies_path}"
+    else:
+        # External mode - check local destination
+        local_dest = config['paths'].get('local_destination', './downloads')
+        local_dest = os.path.abspath(os.path.expanduser(local_dest))
+        try:
+            import shutil
+            stat = shutil.disk_usage(local_dest)
+            dest_free = stat.free
+        except Exception:
+            dest_free = 0
+        dest_path = local_dest
     
     mode_str = "INTERNAL (Pi → Pi)" if mode == 'internal' else "EXTERNAL (Pi → Laptop)"
     
@@ -214,12 +256,24 @@ def confirm_operation(selected: list, dry_run: bool, mode: str) -> bool:
     else:
         mode_text = f"[bold red]LIVE MODE - {mode_str}[/bold red]"
     
+    # Check if items fit
+    space_ok = total_size <= dest_free
+    
+    # Build space info text
+    space_text = f"\n[dim]Source size: {format_size(total_size)}[/dim]\n[dim]Destination free: {format_size(dest_free)} at {dest_path}[/dim]"
+    if not space_ok and not dry_run:
+        shortfall = total_size - dest_free
+        space_text += f"\n[red bold]⚠ Insufficient space! Need {format_size(shortfall)} more[/red bold]"
+    elif space_ok and not dry_run:
+        space_text += "\n[green]✓ Sufficient space available[/green]"
+    
     console.print(Panel.fit(
         f"{mode_text}\n"
         f"Selected: {len(selected)} item(s)\n"
         f"  TV Shows: {tv_count}\n"
         f"  Movies: {movie_count}\n"
-        f"Total files: {total_items}",
+        f"Total files: {total_items}"
+        f"{space_text}",
         title="Confirm Operation"
     ))
     
@@ -230,6 +284,17 @@ def confirm_operation(selected: list, dry_run: bool, mode: str) -> bool:
             console.print("[red]This will COPY files within the Pi to your Jellyfin library.[/red]")
         else:
             console.print("[red]This will COPY files from Pi to your local laptop.[/red]")
+    
+    # If insufficient space, ask user what to do
+    if not space_ok and not dry_run:
+        console.print("\n[yellow]Selected items may not fit in destination.[/yellow]")
+        try:
+            confirm = inquirer.prompt([
+                inquirer.Confirm('proceed', message="Proceed anyway?", default=False)
+            ])
+            return confirm and confirm['proceed']
+        except KeyboardInterrupt:
+            return False
     
     try:
         confirm = inquirer.prompt([
@@ -317,9 +382,9 @@ def main():
         scanner.close()
         sys.exit(0)
     
-    # Confirm operation
+    # Confirm operation with disk space check
     dry_run = config['options'].get('dry_run', False)
-    if not confirm_operation(selected, dry_run, mode):
+    if not confirm_operation(selected, dry_run, mode, scanner, config):
         console.print("[yellow]Operation cancelled.[/yellow]")
         scanner.close()
         sys.exit(0)
