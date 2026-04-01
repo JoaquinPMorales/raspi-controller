@@ -817,39 +817,33 @@ async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             key_filename=pi_config.get('key_path')
         )
         
-        # Check common service names - try multiple detection methods
+        # Check common service names
         services = {
-            'Jellyfin': ['jellyfin', 'jellyfin-server', 'jellyfin.service'],
-            'qBittorrent': ['qbittorrent', 'qbittorrent-nox', 'qbittorrent.service'],
-            'Plex': ['plexmediaserver', 'plex', 'plex-media-server'],
-            'Samba': ['smbd', 'samba', 'smb.service'],
+            'Jellyfin': ['jellyfin'],
+            'qBittorrent': ['qbittorrent-nox', 'qbittorrent'],
+            'Plex': ['plexmediaserver'],
+            'Samba': ['smbd'],
         }
         
         results = []
         for name, possible_names in services.items():
-            status = "❌ Stopped"
-            debug_info = []
+            status = None
             for svc in possible_names:
                 try:
-                    # First check if service exists (without sudo to avoid password prompt for simple check)
-                    stdin, stdout, stderr = ssh.exec_command(f'systemctl list-units --type=service --all | grep -i {svc} | head -1')
-                    service_check = stdout.read().decode().strip()
-                    
-                    if service_check:
-                        # Service exists, now check if active (may need sudo)
-                        stdin, stdout, stderr = ssh.exec_command(f'sudo -S systemctl is-active --quiet {svc}; echo $?')
-                        if sudo_password:
-                            stdin.write(sudo_password + '\n')
-                            stdin.flush()
-                        exit_code = stdout.read().decode().strip()
-                        if exit_code == '0':
-                            status = "✅ Running"
-                            break
-                        debug_info.append(f"{svc}:exit{exit_code}")
-                    else:
-                        debug_info.append(f"{svc}:notfound")
-                except Exception as e:
-                    debug_info.append(f"{svc}:err")
+                    # Check active state directly - no sudo needed for is-active
+                    _, stdout, _ = ssh.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+                    output = stdout.read().decode().strip()
+                    if output == 'active':
+                        status = "✅ Running"
+                        break
+                    elif output in ('inactive', 'failed', 'activating', 'deactivating'):
+                        status = "❌ Stopped"
+                        break
+                    # empty output means service doesn't exist, try next name
+                except Exception:
+                    pass
+            if status is None:
+                status = "⚫ Not installed"
             results.append(f"{name}: {status}")
         
         ssh.close()
@@ -1228,6 +1222,45 @@ async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     status = "✅ enabled" if new_setting else "❌ disabled"
     await update.message.reply_text(f"🔔 Notifications {status}. You'll get alerts when downloads finish.")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show disk space status."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    await update.message.reply_text("🔍 Checking disk space...")
+    
+    from scanner import FolderScanner
+    scanner = FolderScanner(config['pi'])
+    
+    if not scanner.connect():
+        await update.message.reply_text("❌ Failed to connect to Pi.")
+        return
+    
+    try:
+        downloads = config['paths']['downloads']
+        shows = config['paths'].get('jellyfin_shows', '/mnt/media/Shows')
+        movies = config['paths'].get('jellyfin_movies', '/mnt/media/Movies')
+        
+        dl_space = scanner.get_disk_space(downloads)
+        shows_space = scanner.get_disk_space(shows)
+        movies_space = scanner.get_disk_space(movies)
+        
+        status_text = (
+            "📊 *Disk Space Status*\n\n"
+            f"*Downloads:* {format_size(dl_space['available'])} free\n"
+            f"*Shows:* {format_size(shows_space['available'])} free\n"
+            f"*Movies:* {format_size(movies_space['available'])} free"
+        )
+        await update.message.reply_text(status_text, parse_mode='Markdown')
+    finally:
+        scanner.close()
 
 
 def main():
