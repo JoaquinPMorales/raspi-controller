@@ -587,23 +587,23 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     
     help_text = (
-        "🎬 *RasPi Controller Bot - Commands*\n\n"
-        "*Main Commands:*\n"
+        "🎬 RasPi Controller Bot - Commands\n\n"
+        "Main Commands:\n"
         "/start - Start media copy operation\n"
         "/help - Show this help message\n"
         "/status - Check disk space on Pi\n"
         "/cancel - Cancel current operation\n\n"
-        "*How to use:*\n"
+        "How to use:\n"
         "1. Use /start to begin\n"
         "2. Select mode: 📁 Internal, 💻 External, or 🔧 Update\n"
-        "3. Tap items to select/deselect (☑/⬜)\n"
+        "3. Tap items to select/deselect ☑/⬜\n"
         "4. Confirm and execute\n\n"
-        "*Tips:*\n"
+        "Tips:\n"
         "• Bot checks disk space before copying\n"
         "• Use /status anytime to check free space\n"
         "• Updates require sudo_password in config"
     )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(help_text)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
