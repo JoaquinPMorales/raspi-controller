@@ -197,28 +197,54 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     user_data[user_id]['available_items'] = selected_items
     user_data[user_id]['selected_indices'] = set()
-    
-    # Build keyboard with all items
-    for idx, item in enumerate(selected_items):
-        keyboard.append([
-            InlineKeyboardButton(
-                f"⬜ {item['display']}",
-                callback_data=f'toggle_{idx}'
-            )
-        ])
-    
-    keyboard.append([
-        InlineKeyboardButton("✅ Confirm Selection", callback_data='confirm_selection'),
-        InlineKeyboardButton("❌ Cancel", callback_data='cancel')
-    ])
+    user_data[user_id]['page'] = 0
     
     await query.edit_message_text(
         f"📁 Found {len(selected_items)} item(s)\n\n"
         "Tap to select/deselect items:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=build_page_keyboard(selected_items, set(), 0)
     )
     
     return CONTENT_SELECTION
+
+
+PAGE_SIZE = 8
+
+
+def build_page_keyboard(available_items: list, selected_indices: set, page: int) -> InlineKeyboardMarkup:
+    """Build a paginated inline keyboard for item selection."""
+    total = len(available_items)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    
+    keyboard = []
+    for i in range(start, end):
+        item = available_items[i]
+        checkbox = "☑" if i in selected_indices else "⬜"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{checkbox} {item['display']}",
+                callback_data=f'toggle_{i}'
+            )
+        ])
+    
+    # Navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀ Prev", callback_data=f'page_{page - 1}'))
+    nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data='noop'))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next ▶", callback_data=f'page_{page + 1}'))
+    keyboard.append(nav_row)
+    
+    selected_count = len(selected_indices)
+    keyboard.append([
+        InlineKeyboardButton(f"✅ Confirm ({selected_count} selected)", callback_data='confirm_selection'),
+        InlineKeyboardButton("❌ Cancel", callback_data='cancel')
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def toggle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -227,34 +253,23 @@ async def toggle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     
     user_id = update.effective_user.id
-    idx = int(query.data.split('_')[1])
-    selected_indices = user_data[user_id]['selected_indices']
+    data = query.data
     available_items = user_data[user_id]['available_items']
+    selected_indices = user_data[user_id]['selected_indices']
+    page = user_data[user_id].get('page', 0)
     
-    if idx in selected_indices:
-        selected_indices.remove(idx)
-    else:
-        selected_indices.add(idx)
-    
-    # Rebuild keyboard with updated selection state
-    keyboard = []
-    for i, item in enumerate(available_items):
-        selected = i in selected_indices
-        checkbox = "☑" if selected else "⬜"
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{checkbox} {item['display']}",
-                callback_data=f'toggle_{i}'
-            )
-        ])
-    
-    keyboard.append([
-        InlineKeyboardButton("✅ Confirm Selection", callback_data='confirm_selection'),
-        InlineKeyboardButton("❌ Cancel", callback_data='cancel')
-    ])
+    if data.startswith('page_'):
+        page = int(data.split('_')[1])
+        user_data[user_id]['page'] = page
+    elif data.startswith('toggle_'):
+        idx = int(data.split('_')[1])
+        if idx in selected_indices:
+            selected_indices.remove(idx)
+        else:
+            selected_indices.add(idx)
     
     await query.edit_message_reply_markup(
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=build_page_keyboard(available_items, selected_indices, page)
     )
     
     return CONTENT_SELECTION
@@ -667,6 +682,8 @@ def main():
             ],
             CONTENT_SELECTION: [
                 CallbackQueryHandler(toggle_selection, pattern='^toggle_'),
+                CallbackQueryHandler(toggle_selection, pattern='^page_'),
+                CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern='^noop$'),
                 CallbackQueryHandler(confirm_selection, pattern='^confirm_selection$'),
                 CallbackQueryHandler(cancel, pattern='^cancel$'),
             ],
@@ -679,6 +696,8 @@ def main():
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
+            CommandHandler('help', help_command),
+            CommandHandler('status', status_command),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
         ],
     )
