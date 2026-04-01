@@ -606,6 +606,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start - Start media copy operation\n"
         "/help - Show this help message\n"
         "/status - Check disk space on Pi\n"
+        "/health - Check disk health (SMART)\n"
+        "/services - Check Jellyfin/qBittorrent status\n"
+        "/reboot - Reboot the Pi\n"
         "/cancel - Cancel current operation\n\n"
         "How to use:\n"
         "1. Use /start to begin\n"
@@ -781,6 +784,157 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"❌ Error checking health: {error_type}: {str(e)}")
 
 
+async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check if Jellyfin and qBittorrent services are running."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    await update.message.reply_text("🔍 Checking services...")
+    
+    import paramiko
+    pi_config = config['pi']
+    sudo_password = pi_config.get('sudo_password', '')
+    
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            pi_config['host'],
+            port=pi_config.get('port', 22),
+            username=pi_config['user'],
+            password=pi_config.get('password'),
+            key_filename=pi_config.get('key_path')
+        )
+        
+        # Check common service names
+        services = {
+            'Jellyfin': ['jellyfin', 'jellyfin-server'],
+            'qBittorrent': ['qbittorrent', 'qbittorrent-nox'],
+            'Plex': ['plexmediaserver'],
+            'Samba': ['smbd', 'samba'],
+        }
+        
+        results = []
+        for name, possible_names in services.items():
+            status = "❌ Stopped"
+            for svc in possible_names:
+                try:
+                    stdin, stdout, _ = ssh.exec_command(f'sudo -S systemctl is-active {svc} 2>/dev/null', get_pty=True)
+                    if sudo_password:
+                        stdin.write(sudo_password + '\n')
+                        stdin.flush()
+                    output = stdout.read().decode().strip()
+                    if output == 'active':
+                        status = "✅ Running"
+                        break
+                except Exception:
+                    pass
+            results.append(f"{name}: {status}")
+        
+        ssh.close()
+        
+        result = "🔧 *Services Status*\n\n" + "\n".join(results)
+        await update.message.reply_text(result, parse_mode='Markdown')
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error checking services: {str(e)}")
+
+
+async def reboot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reboot the Pi remotely with confirmation."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    # Check if this is a confirmation
+    args = context.args
+    if args and args[0] == 'confirm':
+        # Execute reboot
+        await update.message.reply_text("🔄 Rebooting Pi...")
+        
+        import paramiko
+        pi_config = config['pi']
+        sudo_password = pi_config.get('sudo_password', '')
+        
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                pi_config['host'],
+                port=pi_config.get('port', 22),
+                username=pi_config['user'],
+                password=pi_config.get('password'),
+                key_filename=pi_config.get('key_path')
+            )
+            
+            stdin, _, _ = ssh.exec_command('sudo -S reboot 2>&1', get_pty=True)
+            if sudo_password:
+                stdin.write(sudo_password + '\n')
+                stdin.flush()
+            ssh.close()
+            
+            await update.message.reply_text("✅ Reboot command sent. The Pi will be offline for ~30 seconds.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+    else:
+        # Ask for confirmation
+        keyboard = [
+            [InlineKeyboardButton("✅ Yes, Reboot", callback_data='reboot_confirm')],
+            [InlineKeyboardButton("❌ Cancel", callback_data='reboot_cancel')]
+        ]
+        await update.message.reply_text(
+            "⚠️ *Reboot Confirmation*\n\nAre you sure you want to reboot the Pi?",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
+async def reboot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle reboot confirmation/cancel."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'reboot_confirm':
+        await query.edit_message_text("🔄 Rebooting Pi...")
+        
+        import paramiko
+        config = context.bot_data.get('config')
+        pi_config = config['pi']
+        sudo_password = pi_config.get('sudo_password', '')
+        
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                pi_config['host'],
+                port=pi_config.get('port', 22),
+                username=pi_config['user'],
+                password=pi_config.get('password'),
+                key_filename=pi_config.get('key_path')
+            )
+            
+            stdin, _, _ = ssh.exec_command('sudo -S reboot 2>&1', get_pty=True)
+            if sudo_password:
+                stdin.write(sudo_password + '\n')
+                stdin.flush()
+            ssh.close()
+            
+            await query.edit_message_text("✅ Reboot command sent.\nThe Pi will be offline for ~30-60 seconds.")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+    else:
+        await query.edit_message_text("❌ Reboot cancelled.")
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show disk space status."""
     config = context.bot_data.get('config')
@@ -842,6 +996,8 @@ def main():
             BotCommand('help', 'Show available commands'),
             BotCommand('status', 'Check disk space on Pi'),
             BotCommand('health', 'Check disk health (SMART)'),
+            BotCommand('services', 'Check Jellyfin/qBittorrent status'),
+            BotCommand('reboot', 'Reboot the Pi'),
             BotCommand('cancel', 'Cancel current operation'),
         ])
     
@@ -875,6 +1031,9 @@ def main():
             CommandHandler('help', help_command),
             CommandHandler('status', status_command),
             CommandHandler('health', health_command),
+            CommandHandler('services', services_command),
+            CommandHandler('reboot', reboot_command),
+            CallbackQueryHandler(reboot_callback, pattern='^reboot_'),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
         ],
     )
@@ -883,10 +1042,12 @@ def main():
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('status', status_command))
     application.add_handler(CommandHandler('health', health_command))
+    application.add_handler(CommandHandler('services', services_command))
+    application.add_handler(CommandHandler('reboot', reboot_command))
     
     # Run the bot
     print("Starting Telegram bot...")
-    print("Available commands: /start, /help, /status, /health, /cancel")
+    print("Available commands: /start, /help, /status, /health, /services, /reboot, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
