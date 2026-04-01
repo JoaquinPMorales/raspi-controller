@@ -33,3 +33,11 @@ telegram:
   token: "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather on Telegram
   allowed_users: []             # List of allowed Telegram user IDs (empty = allow all)
                                 # Use /start to see your user ID if unauthorized
+
+# qBittorrent Configuration (optional, for /downloads command)
+# Enable Web UI in qBittorrent: Tools → Options → Web UI → Enable
+qbittorrent:
+  host: "localhost"           # qBittorrent host (usually localhost if on same Pi)
+  port: 8080                  # Web UI port (default 8080)
+  username: "admin"           # Web UI username
+  password: "adminadmin"      # Web UI password

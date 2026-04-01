@@ -8,6 +8,7 @@ import sys
 import yaml
 import logging
 import asyncio
+import httpx
 from typing import Dict, List, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -608,6 +609,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/status - Check disk space on Pi\n"
         "/health - Check disk health (SMART)\n"
         "/services - Check Jellyfin/qBittorrent status\n"
+        "/downloads - Show qBittorrent download status\n"
         "/reboot - Reboot the Pi\n"
         "/cancel - Cancel current operation\n\n"
         "How to use:\n"
@@ -935,6 +937,110 @@ async def reboot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("❌ Reboot cancelled.")
 
 
+async def downloads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current qBittorrent download status."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    qb_config = config.get('qbittorrent', {})
+    if not qb_config.get('host') or not qb_config.get('password'):
+        await update.message.reply_text(
+            "⚠️ qBittorrent not configured.\n\n"
+            "Add to config.yaml:\n"
+            "```\n"
+            "qbittorrent:\n"
+            "  host: localhost\n"
+            "  port: 8080\n"
+            "  username: admin\n"
+            "  password: your_password\n"
+            "```"
+        )
+        return
+    
+    await update.message.reply_text("📥 Checking downloads...")
+    
+    try:
+        base_url = f"http://{qb_config['host']}:{qb_config.get('port', 8080)}/api/v2"
+        
+        # Create client with cookie persistence
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Login
+            login_resp = await client.post(
+                f"{base_url}/auth/login",
+                data={
+                    'username': qb_config['username'],
+                    'password': qb_config['password']
+                }
+            )
+            
+            if login_resp.status_code != 200 or login_resp.text != 'Ok.':
+                await update.message.reply_text("❌ Failed to connect to qBittorrent. Check credentials.")
+                return
+            
+            # Get torrents using same session (cookies auto-preserved)
+            torrents_resp = await client.get(f"{base_url}/torrents/info")
+            
+            if torrents_resp.status_code != 200:
+                await update.message.reply_text("❌ Failed to get torrent list.")
+                return
+            
+            torrents = torrents_resp.json()
+        
+        # Filter to only show actively downloading torrents
+        downloading_states = ['downloading', 'stalledDL', 'forcedDL', 'metaDL', 'queuedDL', 'checkingDL']
+        active_downloads = [t for t in torrents if t.get('state') in downloading_states]
+        
+        if not active_downloads:
+            await update.message.reply_text("📭 No active downloads (only seeding torrents found).")
+            return
+        
+        # Build status message
+        lines = ["📥 *Active Downloads*\n"]
+        
+        for t in active_downloads[:10]:  # Limit to 10 torrents
+            name = t['name'][:30] + "..." if len(t['name']) > 30 else t['name']
+            progress = t['progress'] * 100
+            state = t['state']
+            size = t['total_size'] / (1024**3)  # GB
+            dlspeed = t['dlspeed'] / (1024**2)  # MB/s
+            eta = t.get('eta', 86400)  # seconds, default to 24h
+            
+            # Format ETA
+            if eta == 0:
+                eta_str = "Almost done"
+            elif eta >= 86400:
+                eta_str = f"{eta // 86400}d remaining"
+            elif eta >= 3600:
+                eta_str = f"{eta // 3600}h remaining"
+            else:
+                eta_str = f"{eta // 60}m remaining"
+            
+            # Progress bar
+            bar_filled = round(progress / 10)
+            bar = "█" * bar_filled + "░" * (10 - bar_filled)
+            
+            lines.append(f"⬇️ *{name}*")
+            lines.append(f"`[{bar}]` {progress:.1f}%")
+            lines.append(f"  💨 {dlspeed:.1f} MB/s | ⏱️ {eta_str}")
+            lines.append(f"  📊 {size:.1f} GB")
+        
+        if len(active_downloads) > 10:
+            lines.append(f"\n... and {len(active_downloads) - 10} more downloading")
+        
+        result = "\n".join(lines)
+        await update.message.reply_text(result, parse_mode='Markdown')
+        
+    except httpx.ConnectError:
+        await update.message.reply_text("❌ Cannot connect to qBittorrent.\n\nCheck:\n1. Web UI is enabled\n2. Host/port are correct\n3. qBittorrent is running")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show disk space status."""
     config = context.bot_data.get('config')
@@ -997,6 +1103,7 @@ def main():
             BotCommand('status', 'Check disk space on Pi'),
             BotCommand('health', 'Check disk health (SMART)'),
             BotCommand('services', 'Check Jellyfin/qBittorrent status'),
+            BotCommand('downloads', 'Show qBittorrent download status'),
             BotCommand('reboot', 'Reboot the Pi'),
             BotCommand('cancel', 'Cancel current operation'),
         ])
@@ -1032,6 +1139,7 @@ def main():
             CommandHandler('status', status_command),
             CommandHandler('health', health_command),
             CommandHandler('services', services_command),
+            CommandHandler('downloads', downloads_command),
             CommandHandler('reboot', reboot_command),
             CallbackQueryHandler(reboot_callback, pattern='^reboot_'),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
@@ -1043,11 +1151,12 @@ def main():
     application.add_handler(CommandHandler('status', status_command))
     application.add_handler(CommandHandler('health', health_command))
     application.add_handler(CommandHandler('services', services_command))
+    application.add_handler(CommandHandler('downloads', downloads_command))
     application.add_handler(CommandHandler('reboot', reboot_command))
     
     # Run the bot
     print("Starting Telegram bot...")
-    print("Available commands: /start, /help, /status, /health, /services, /reboot, /cancel")
+    print("Available commands: /start, /help, /status, /health, /services, /downloads, /reboot, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
