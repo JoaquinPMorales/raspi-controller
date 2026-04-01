@@ -560,16 +560,30 @@ async def run_update_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the operation."""
-    query = update.callback_query
-    await query.answer()
-    
     user_id = update.effective_user.id
     
+    # Handle both callback queries and direct commands
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        message = query.message
+        edit_func = query.edit_message_text
+    else:
+        message = update.message
+        edit_func = None
+    
+    # Close scanner if open
     if user_id in user_data and 'scanner' in user_data[user_id]:
         user_data[user_id]['scanner'].close()
     
-    await query.edit_message_text("❌ Operation cancelled.")
+    # Show cancel confirmation
+    cancel_text = "❌ Operation cancelled."
+    if edit_func:
+        await edit_func(cancel_text)
+    elif message:
+        await message.reply_text(cancel_text)
     
+    # Clean up user data
     if user_id in user_data:
         del user_data[user_id]
     
