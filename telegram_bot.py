@@ -615,9 +615,170 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Tips:\n"
         "• Bot checks disk space before copying\n"
         "• Use /status anytime to check free space\n"
+        "• Use /health to check disk health (SMART)\n"
         "• Updates require sudo_password in config"
     )
     await update.message.reply_text(help_text)
+
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check disk health using smartctl."""
+    config = context.bot_data.get('config')
+    if not config:
+        await update.message.reply_text("❌ Config not loaded.")
+        return
+        
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    await update.message.reply_text("🔍 Checking disk health...")
+    
+    import paramiko
+    pi_config = config['pi']
+    
+    sudo_password = pi_config.get('sudo_password', '')
+    
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            pi_config['host'],
+            port=pi_config.get('port', 22),
+            username=pi_config['user'],
+            password=pi_config.get('password'),
+            key_filename=pi_config.get('key_path')
+        )
+        
+        # Detect existing drives first
+        _, out, _ = ssh.exec_command('lsblk -dno NAME,TYPE | grep disk')
+        detected = [f"/dev/{line.split()[0]}" for line in out.read().decode().strip().splitlines() if line.strip()]
+        drives = detected if detected else ['/dev/sda', '/dev/sdb']
+        health_info = []
+        
+        for drive in drives:
+            try:
+                # Get full SMART attributes
+                stdin, stdout, _ = ssh.exec_command(f'sudo -S smartctl -A -H {drive} 2>/dev/null', get_pty=True)
+                if sudo_password:
+                    stdin.write(sudo_password + '\n')
+                    stdin.flush()
+                output = stdout.read().decode()
+                
+                if not output or 'No such device' in output or 'Unable to detect' in output:
+                    continue
+                
+                # Overall health
+                passed = 'PASSED' in output
+                failed = 'FAILED' in output
+                
+                # Parse key SMART attributes
+                issues = 0
+                max_issues = 0
+                temp = None
+                reallocated = 0
+                pending = 0
+                uncorrectable = 0
+                power_on_hours = None
+                wear_level = None  # SSD wear % (100 = new, 0 = worn out)
+                
+                for line in output.splitlines():
+                    parts = line.split()
+                    # SMART attribute lines: ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
+                    if len(parts) < 10:
+                        continue
+                    try:
+                        int(parts[0])  # first col is numeric ID
+                    except ValueError:
+                        continue
+                    attr_name = parts[1].lower()
+                    raw_val = parts[9]  # RAW_VALUE is always column index 9
+                    
+                    try:
+                        raw_int = int(raw_val.split()[0])
+                    except (ValueError, IndexError):
+                        raw_int = 0
+                    
+                    if 'reallocated' in attr_name and 'sector' in attr_name:
+                        reallocated = raw_int
+                        max_issues += 1
+                        if raw_int > 0:
+                            issues += 1
+                    elif 'pending' in attr_name:
+                        pending = raw_int
+                        max_issues += 1
+                        if raw_int > 0:
+                            issues += 1
+                    elif 'uncorrectable' in attr_name or 'offline_uncorrect' in attr_name:
+                        uncorrectable = raw_int
+                        max_issues += 1
+                        if raw_int > 0:
+                            issues += 1
+                    elif 'temperature' in attr_name or 'airflow_temp' in attr_name:
+                        temp = raw_int
+                    elif 'power_on_hours' in attr_name or 'power_on_time' in attr_name:
+                        power_on_hours = raw_int
+                    elif 'wear_level' in attr_name or 'wearout' in attr_name or 'ssd_life' in attr_name:
+                        # Most SSDs report wear in VALUE column (100=new, 0=dead)
+                        # Raw value sometimes has vendor-specific format, so use VALUE
+                        wear_level = int(parts[3]) if len(parts) > 3 else None
+                
+                # Calculate sanity score
+                if failed:
+                    score = 0
+                elif max_issues > 0:
+                    score = max(0, round((1 - issues / max_issues) * 100))
+                else:
+                    score = 100 if passed else 70
+                
+                # Score emoji
+                if score >= 90:
+                    score_emoji = "🟢"
+                elif score >= 60:
+                    score_emoji = "🟡"
+                else:
+                    score_emoji = "🔴"
+                
+                # Build drive summary
+                bar_filled = round(score / 10)
+                bar = "█" * bar_filled + "░" * (10 - bar_filled)
+                lines = [f"{score_emoji} *{drive}* — {score}% healthy", f"`[{bar}]`"]
+                # Always show sector counts
+                sector_emoji = "✅" if reallocated == 0 else "⚠️"
+                lines.append(f"  {sector_emoji} Reallocated sectors: {reallocated}")
+                pending_emoji = "✅" if pending == 0 else "⚠️"
+                lines.append(f"  {pending_emoji} Pending sectors: {pending}")
+                uncorr_emoji = "✅" if uncorrectable == 0 else "❌"
+                lines.append(f"  {uncorr_emoji} Uncorrectable: {uncorrectable}")
+                if temp is not None:
+                    temp_emoji = "🌡️" if temp < 50 else "🔥"
+                    lines.append(f"  {temp_emoji} Temp: {temp}°C")
+                if wear_level is not None:
+                    wear_emoji = "💚" if wear_level >= 80 else "💛" if wear_level >= 50 else "❤️"
+                    lines.append(f"  {wear_emoji} SSD Wear: {wear_level}% remaining")
+                if power_on_hours is not None:
+                    lines.append(f"  ⏱️ Power-on: {power_on_hours}h ({power_on_hours // 24}d)")
+                
+                health_info.append("\n".join(lines))
+                
+            except Exception:
+                pass
+        
+        ssh.close()
+        
+        if health_info:
+            result = "🩺 *Disk Health Report*\n\n" + "\n\n".join(health_info)
+        else:
+            result = "⚠️ Could not retrieve disk health.\nMake sure smartmontools is installed:\n`sudo apt install smartmontools`"
+        
+        await update.message.reply_text(result, parse_mode='Markdown')
+        
+    except Exception as e:
+        error_type = type(e).__name__
+        await update.message.reply_text(f"❌ Error checking health: {error_type}: {str(e)}")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -680,6 +841,7 @@ def main():
             BotCommand('start', 'Start media copy operation'),
             BotCommand('help', 'Show available commands'),
             BotCommand('status', 'Check disk space on Pi'),
+            BotCommand('health', 'Check disk health (SMART)'),
             BotCommand('cancel', 'Cancel current operation'),
         ])
     
@@ -712,6 +874,7 @@ def main():
             CommandHandler('cancel', cancel),
             CommandHandler('help', help_command),
             CommandHandler('status', status_command),
+            CommandHandler('health', health_command),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
         ],
     )
@@ -719,10 +882,11 @@ def main():
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('status', status_command))
+    application.add_handler(CommandHandler('health', health_command))
     
     # Run the bot
     print("Starting Telegram bot...")
-    print("Available commands: /start, /help, /status, /cancel")
+    print("Available commands: /start, /help, /status, /health, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
