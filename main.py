@@ -11,6 +11,7 @@ import os
 import sys
 import yaml
 import signal
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +23,7 @@ import inquirer
 from scanner import FolderScanner
 from copier import RsyncCopier, ExternalCopier
 from jellyfin import refresh_jellyfin_library
+from updater import SystemUpdater
 
 console = Console()
 
@@ -55,6 +57,18 @@ def validate_config(config: dict) -> bool:
         return False
     
     return True
+
+
+def check_host_connectivity(host: str, port: int = 22, timeout: int = 5) -> bool:
+    """Check if host is reachable before attempting SSH connection."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
 
 
 def organize_items(items: list) -> tuple:
@@ -175,6 +189,7 @@ def select_mode() -> str:
                      choices=[
                          ('Internal - Move files within Pi (downloads → Jellyfin)', 'internal'),
                          ('External - Copy files from Pi to this laptop', 'external'),
+                         ('Maintenance - Update Pi system and Flatpak apps', 'update'),
                      ],
                      default='internal')
     ]
@@ -241,6 +256,33 @@ def main():
     config = load_config()
     if not validate_config(config):
         sys.exit(1)
+    
+    # Handle update mode separately (no scanning needed)
+    if mode == 'update':
+        handle_update_mode(config)
+        return
+    
+    # Check connectivity before attempting SSH
+    pi_host = config['pi']['host']
+    pi_port = config['pi'].get('port', 22)
+    
+    console.print(f"\n[blue]Checking connectivity to {pi_host}:{pi_port}...[/blue]")
+    if not check_host_connectivity(pi_host, pi_port):
+        console.print(f"[red]Cannot reach {pi_host}:{pi_port}[/red]")
+        console.print(Panel.fit(
+            "[yellow]Possible causes:[/yellow]\n"
+            "• Raspberry Pi is offline or powered off\n"
+            "• Network connection issue\n"
+            "• [bold]WireGuard VPN not connected[/bold] (if using VPN)\n\n"
+            "[dim]If using WireGuard VPN:[/dim]\n"
+            "1. Activate your WireGuard connection first\n"
+            "2. Verify with: ping <pi-ip-address>\n"
+            "3. Then run this script again",
+            title="Connection Failed"
+        ))
+        sys.exit(1)
+    
+    console.print("[green]Host is reachable![/green]")
     
     # Connect to Raspberry Pi
     console.print("\n[blue]Connecting to Raspberry Pi...[/blue]")
@@ -326,6 +368,52 @@ def main():
         console.print(f"\n[red]Error during copy: {e}[/red]")
     finally:
         scanner.close()
+
+
+def handle_update_mode(config: dict):
+    """Handle the maintenance/update mode."""
+    dry_run = config['options'].get('dry_run', False)
+    
+    # Confirm update operation
+    mode_text = "[bold yellow]DRY RUN MODE[/bold yellow]" if dry_run else "[bold red]LIVE MODE[/bold red]"
+    console.print(Panel.fit(
+        f"{mode_text}\n"
+        "Update Raspberry Pi system packages\n"
+        "Update Flatpak applications",
+        title="Maintenance - System Update"
+    ))
+    
+    if dry_run:
+        console.print("[yellow]This will show what would be updated without making changes.[/yellow]")
+    else:
+        console.print("[red]This will update the system and may take several minutes.[/red]")
+    
+    try:
+        confirm = inquirer.prompt([
+            inquirer.Confirm('proceed', message="Proceed with updates?", default=True)
+        ])
+        if not confirm or not confirm['proceed']:
+            console.print("[yellow]Operation cancelled.[/yellow]")
+            return
+    except KeyboardInterrupt:
+        return
+    
+    # Create updater and run updates
+    updater = SystemUpdater(config['pi'])
+    
+    def signal_handler(sig, frame):
+        console.print("\n[yellow]Interrupted by user. Cleaning up...[/yellow]")
+        updater.cancel()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        success = updater.perform_updates(console, dry_run)
+        if not success:
+            console.print("\n[red bold]Some updates failed. Check the output above.[/red bold]")
+    except Exception as e:
+        console.print(f"\n[red]Error during updates: {e}[/red]")
 
 
 if __name__ == "__main__":

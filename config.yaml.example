@@ -8,6 +8,7 @@ pi:
   password: null              # SSH password (null if using key)
   key_path: "~/.ssh/id_rsa"   # SSH private key path (null if using password)
   port: 22                    # SSH port
+  sudo_password: null         # Sudo password for update mode (required for Maintenance mode)
 
 paths:
   downloads: "/mnt/storage/downloads"           # qBittorrent download directory

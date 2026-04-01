@@ -44,9 +44,9 @@ cp config.yaml.example config.yaml
 4. **Edit `config.yaml` with your settings:**
 ```yaml
 pi:
-  host: "192.168.1.174"      # Your Raspberry Pi IP address
-  user: "joaquin"            # SSH username
-  password: "yourpassword"     # SSH password (or use key_path)
+  host: "<pi-ip-address>"      # Your Raspberry Pi IP address
+  user: "<username>"            # SSH username
+  password: "<your-password>"     # SSH password (or use key_path)
   key_path: null             # Or: "~/.ssh/id_rsa"
 
 paths:
@@ -75,7 +75,7 @@ To enable automatic library refresh after copying:
 Instead of password authentication, use SSH keys:
 
 ```bash
-ssh-copy-id joaquin@192.168.1.174
+ssh-copy-id <username>@<pi-ip-address>
 ```
 
 Then in `config.yaml`:
@@ -100,6 +100,12 @@ python main.py
 
 When you start the script, you'll be prompted to select a mode:
 
+#### Maintenance Mode (Update Pi & Flatpak)
+- Updates Raspberry Pi system packages via SSH
+- Updates Flatpak applications
+- Requires `sudo_password` in `config.yaml`
+- Best for: Keeping your Pi system up-to-date remotely
+
 #### Internal Mode (Pi → Pi)
 - Copies files from `downloads` to `Shows`/`Movies` folders on the Raspberry Pi
 - Automatically refreshes Jellyfin library (if API key configured)
@@ -110,7 +116,81 @@ When you start the script, you'll be prompted to select a mode:
 - Saves to `./downloads/TV/` and `./downloads/Movies/` by default
 - Best for: Watching content offline or backing up
 
-### Workflow
+### Maintenance Mode (Update Pi) Prerequisites
+
+Update mode requires **sudo_password** configured in `config.yaml`. Add it to the pi section:
+
+```yaml
+pi:
+  host: "<pi-ip-address>"
+  user: "<username>"
+  password: null              # SSH password (if using password auth)
+  key_path: "~/.ssh/id_rsa"   # SSH key (if using key auth)
+  sudo_password: "your-sudo-password"  # Required for update mode
+```
+
+The sudo password is passed securely via stdin using `sudo -S` and is never logged.
+
+## VPN / WireGuard
+
+If your Raspberry Pi is behind a WireGuard VPN, connect the VPN **before** running this script.
+
+### Why separate?
+
+Keeping VPN and script separate is recommended because:
+- VPN management requires `sudo` privileges
+- WireGuard behaves differently across operating systems
+- The script should focus on media management, not network configuration
+
+### Setup
+
+1. **Connect WireGuard first:**
+   ```bash
+   # Linux (NetworkManager)
+   nmcli connection up wireguard-pi
+   
+   # macOS (with WireGuard app)
+   wg-quick up ~/Documents/wireguard/pi.conf
+   
+   # Windows
+   # Use WireGuard GUI to activate tunnel
+   ```
+
+2. **Verify connectivity:**
+   ```bash
+   ping <pi-ip-address>  # Your Pi's VPN IP
+   ```
+
+3. **Run the script:**
+   ```bash
+   python main.py
+   ```
+
+### VPN Connection Warning
+
+The script checks connectivity before attempting SSH. If the Pi isn't reachable, you'll see:
+
+```
+[red]Cannot reach <pi-ip-address>:22[/red]
+Possible causes:
+• Raspberry Pi is offline or powered off
+• Network connection issue
+• WireGuard VPN not connected (if using VPN)
+```
+
+### Troubleshooting VPN
+
+**Can't connect even with VPN active:**
+- Verify VPN IP matches `pi.host` in `config.yaml`
+- Check if Pi's WireGuard is running: `sudo wg show`
+- Ensure Pi allows SSH over WireGuard interface
+
+**Slow transfers over VPN:**
+- Enable compression: add `-z` to rsync flags (internal mode)
+- Use lower bandwidth limit: `bwlimit: 5000` (5 MB/s)
+- Consider using local network instead of VPN for large transfers
+
+## Workflow
 
 1. **Connect**: Script connects to your Pi via SSH
 2. **Scan**: Discovers TV shows and movies in the downloads folder
@@ -177,7 +257,7 @@ The script detects content type based on file/folder names:
 
 ### Connection Issues
 
-- Verify SSH access: `ssh joaquin@192.168.1.174`
+- Verify SSH access: `ssh <user>@<pi-ip-address>`
 - Check Pi is powered on and connected to network
 - Verify credentials in `config.yaml`
 
