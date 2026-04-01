@@ -500,6 +500,7 @@ async def proceed_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def run_update_process(update: Update, context: ContextTypes.DEFAULT_TYPE, config: dict):
     """Run the actual update process."""
     query = update.callback_query
+    user_id = update.effective_user.id
     updater = SystemUpdater(config['pi'])
     
     class TelegramConsole:
@@ -561,21 +562,72 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show help message."""
+    """Show help message with available commands."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
     help_text = (
-        "🎬 *Jellyfin Media Manager Bot*\n\n"
-        "*Commands:*\n"
+        "🎬 *RasPi Controller Bot - Commands*\n\n"
+        "*Main Commands:*\n"
         "/start - Start media copy operation\n"
-        "/help - Show this help\n\n"
-        "*Features:*\n"
-        "• Internal copy (Pi → Pi)\n"
-        "• External copy (Pi → Laptop)\n"
-        "• System updates\n"
-        "• Automatic disk space checks\n\n"
-        "The bot runs on your Raspberry Pi.\n"
-        "Make sure config.yaml is properly set up."
+        "/help - Show this help message\n"
+        "/status - Check disk space on Pi\n"
+        "/cancel - Cancel current operation\n\n"
+        "*How to use:*\n"
+        "1. Use /start to begin\n"
+        "2. Select mode: 📁 Internal, 💻 External, or 🔧 Update\n"
+        "3. Tap items to select/deselect (☑/⬜)\n"
+        "4. Confirm and execute\n\n"
+        "*Tips:*\n"
+        "• Bot checks disk space before copying\n"
+        "• Use /status anytime to check free space\n"
+        "• Updates require sudo_password in config"
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show disk space status."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    await update.message.reply_text("🔍 Checking disk space...")
+    
+    from scanner import FolderScanner
+    scanner = FolderScanner(config['pi'])
+    
+    if not scanner.connect():
+        await update.message.reply_text("❌ Failed to connect to Pi.")
+        return
+    
+    try:
+        downloads = config['paths']['downloads']
+        shows = config['paths'].get('jellyfin_shows', '/mnt/media/Shows')
+        movies = config['paths'].get('jellyfin_movies', '/mnt/media/Movies')
+        
+        dl_space = scanner.get_disk_space(downloads)
+        shows_space = scanner.get_disk_space(shows)
+        movies_space = scanner.get_disk_space(movies)
+        
+        status_text = (
+            "📊 *Disk Space Status*\n\n"
+            f"*Downloads:* {format_size(dl_space['available'])} free\n"
+            f"*Shows:* {format_size(shows_space['available'])} free\n"
+            f"*Movies:* {format_size(movies_space['available'])} free"
+        )
+        await update.message.reply_text(status_text, parse_mode='Markdown')
+    finally:
+        scanner.close()
 
 
 def main():
@@ -591,10 +643,19 @@ def main():
         print("Add telegram.token to your config.yaml")
         sys.exit(1)
     
-    # Create application
-    application = Application.builder().token(token).build()
+    # Register bot commands in Telegram's command menu (shown when typing /)
+    from telegram import BotCommand
     
-    # Store config in bot data
+    async def post_init(app):
+        await app.bot.set_my_commands([
+            BotCommand('start', 'Start media copy operation'),
+            BotCommand('help', 'Show available commands'),
+            BotCommand('status', 'Check disk space on Pi'),
+            BotCommand('cancel', 'Cancel current operation'),
+        ])
+    
+    # Create application with post_init hook and store config
+    application = Application.builder().token(token).post_init(post_init).build()
     application.bot_data['config'] = config
     
     # Conversation handler
@@ -624,9 +685,11 @@ def main():
     
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('status', status_command))
     
     # Run the bot
     print("Starting Telegram bot...")
+    print("Available commands: /start, /help, /status, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
