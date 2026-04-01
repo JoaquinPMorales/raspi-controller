@@ -846,6 +846,25 @@ async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 status = "⚫ Not installed"
             results.append(f"{name}: {status}")
         
+        # Additional check: Try qBittorrent Web UI directly as fallback
+        qb_config = config.get('qbittorrent', {})
+        if qb_config.get('host') and qb_config.get('password'):
+            try:
+                base_url = f"http://{qb_config['host']}:{qb_config.get('port', 8080)}/api/v2"
+                async with httpx.AsyncClient(timeout=5) as client:
+                    login_resp = await client.post(
+                        f"{base_url}/auth/login",
+                        data={'username': qb_config['username'], 'password': qb_config['password']}
+                    )
+                    if login_resp.status_code == 200:
+                        # qBittorrent Web UI is accessible - it's running
+                        for i, line in enumerate(results):
+                            if line.startswith('qBittorrent:'):
+                                results[i] = "qBittorrent: ✅ Running (via Web UI)"
+                                break
+            except Exception:
+                pass  # Web UI not accessible, keep previous status
+        
         ssh.close()
         
         result = "🔧 *Services Status*\n\n" + "\n".join(results)
