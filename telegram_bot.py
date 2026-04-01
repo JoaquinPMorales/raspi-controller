@@ -817,29 +817,39 @@ async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             key_filename=pi_config.get('key_path')
         )
         
-        # Check common service names
+        # Check common service names - try multiple detection methods
         services = {
-            'Jellyfin': ['jellyfin', 'jellyfin-server'],
-            'qBittorrent': ['qbittorrent', 'qbittorrent-nox'],
-            'Plex': ['plexmediaserver'],
-            'Samba': ['smbd', 'samba'],
+            'Jellyfin': ['jellyfin', 'jellyfin-server', 'jellyfin.service'],
+            'qBittorrent': ['qbittorrent', 'qbittorrent-nox', 'qbittorrent.service'],
+            'Plex': ['plexmediaserver', 'plex', 'plex-media-server'],
+            'Samba': ['smbd', 'samba', 'smb.service'],
         }
         
         results = []
         for name, possible_names in services.items():
             status = "❌ Stopped"
+            debug_info = []
             for svc in possible_names:
                 try:
-                    stdin, stdout, _ = ssh.exec_command(f'sudo -S systemctl is-active {svc} 2>/dev/null', get_pty=True)
-                    if sudo_password:
-                        stdin.write(sudo_password + '\n')
-                        stdin.flush()
-                    output = stdout.read().decode().strip()
-                    if output == 'active':
-                        status = "✅ Running"
-                        break
-                except Exception:
-                    pass
+                    # First check if service exists (without sudo to avoid password prompt for simple check)
+                    stdin, stdout, stderr = ssh.exec_command(f'systemctl list-units --type=service --all | grep -i {svc} | head -1')
+                    service_check = stdout.read().decode().strip()
+                    
+                    if service_check:
+                        # Service exists, now check if active (may need sudo)
+                        stdin, stdout, stderr = ssh.exec_command(f'sudo -S systemctl is-active --quiet {svc}; echo $?')
+                        if sudo_password:
+                            stdin.write(sudo_password + '\n')
+                            stdin.flush()
+                        exit_code = stdout.read().decode().strip()
+                        if exit_code == '0':
+                            status = "✅ Running"
+                            break
+                        debug_info.append(f"{svc}:exit{exit_code}")
+                    else:
+                        debug_info.append(f"{svc}:notfound")
+                except Exception as e:
+                    debug_info.append(f"{svc}:err")
             results.append(f"{name}: {status}")
         
         ssh.close()
