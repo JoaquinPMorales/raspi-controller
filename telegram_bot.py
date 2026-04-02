@@ -6,9 +6,11 @@ Run this on your Raspberry Pi to control media operations from your phone.
 import os
 import sys
 import yaml
+import json
 import logging
 import asyncio
 import httpx
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,8 +37,38 @@ logger = logging.getLogger(__name__)
 # Conversation states
 MODE_SELECTION, CONTENT_SELECTION, CONFIRMATION, COPYING = range(4)
 
-# Store user data
+# Store user data and ideas
 user_data: Dict[int, dict] = {}
+ideas_data: List[dict] = []  # List of ideas with date, text, status
+
+USER_DATA_FILE = "user_data.json"
+IDEAS_FILE = "ideas.json"
+
+def load_persistent_data():
+    """Load user data and ideas from JSON files."""
+    global user_data, ideas_data
+    if os.path.exists(USER_DATA_FILE):
+        try:
+            with open(USER_DATA_FILE, 'r') as f:
+                user_data = {int(k): v for k, v in json.load(f).items()}
+        except Exception:
+            user_data = {}
+    if os.path.exists(IDEAS_FILE):
+        try:
+            with open(IDEAS_FILE, 'r') as f:
+                ideas_data = json.load(f)
+        except Exception:
+            ideas_data = []
+
+def save_user_data():
+    """Save user data to JSON file."""
+    with open(USER_DATA_FILE, 'w') as f:
+        json.dump(user_data, f)
+
+def save_ideas():
+    """Save ideas to JSON file."""
+    with open(IDEAS_FILE, 'w') as f:
+        json.dump(ideas_data, f, indent=2, default=str)
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -614,6 +646,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/speed - Run internet speed test\n"
         "/search - Search media in library (e.g. /search Batman)\n"
         "/notify - Toggle download finish alerts\n"
+        "/idea - Save a new idea (e.g. /idea Buy more storage)\n"
+        "/ideas - List all ideas by day\n"
+        "/finish - Mark idea as done (e.g. /finish 3)\n"
         "/reboot - Reboot the Pi\n"
         "/cancel - Cancel current operation\n\n"
         "How to use:\n"
@@ -1196,13 +1231,13 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         results = []
         
-        stdin, stdout, _ = ssh.exec_command(f'find {shows_path} -maxdepth 2 -type d -iname "*{query}*" 2>/dev/null | head -5')
+        stdin, stdout, _ = ssh.exec_command(f'find {shows_path} -maxdepth 3 -type d 2>/dev/null | grep -i "{query}" | head -10')
         shows_found = stdout.read().decode().strip().splitlines()
         for show in shows_found:
-            if show:
+            if show and show != shows_path:
                 results.append(f"📺 {show.split('/')[-1]}")
         
-        stdin, stdout, _ = ssh.exec_command(f'find {movies_path} -maxdepth 2 -type f -iname "*{query}*" 2>/dev/null | head -5')
+        stdin, stdout, _ = ssh.exec_command(f'find {movies_path} -maxdepth 3 -type f 2>/dev/null | grep -i "{query}" | head -10')
         movies_found = stdout.read().decode().strip().splitlines()
         for movie in movies_found:
             if movie:
@@ -1238,9 +1273,104 @@ async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user_id not in user_data:
         user_data[user_id] = {}
     user_data[user_id]['notifications'] = new_setting
+    save_user_data()  # Persist the setting
     
     status = "✅ enabled" if new_setting else "❌ disabled"
     await update.message.reply_text(f"🔔 Notifications {status}. You'll get alerts when downloads finish.")
+
+
+async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save a new idea."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("💡 Usage: `/idea <your idea text>`")
+        return
+    
+    idea_text = ' '.join(context.args)
+    now = datetime.now()
+    
+    idea = {
+        'id': len(ideas_data) + 1,
+        'text': idea_text,
+        'date': now.strftime('%Y-%m-%d'),
+        'time': now.strftime('%H:%M'),
+        'status': 'pending',
+        'user_id': user_id
+    }
+    ideas_data.append(idea)
+    save_ideas()
+    
+    await update.message.reply_text(f"💡 Idea #{idea['id']} saved for {idea['date']}!")
+
+
+async def ideas_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List ideas by day."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    if not ideas_data:
+        await update.message.reply_text("💡 No ideas saved yet. Use `/idea <text>` to add one.")
+        return
+    
+    # Group by date
+    by_date = {}
+    for idea in ideas_data:
+        date = idea['date']
+        if date not in by_date:
+            by_date[date] = []
+        by_date[date].append(idea)
+    
+    # Build output
+    lines = ["💡 *Your Ideas*\n"]
+    for date in sorted(by_date.keys(), reverse=True):
+        lines.append(f"\n📅 *{date}*")
+        for idea in by_date[date]:
+            status_icon = "✅" if idea['status'] == 'done' else "⏳"
+            lines.append(f"  {status_icon} #{idea['id']}: {idea['text']}")
+    
+    await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+
+
+async def finish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark an idea as finished."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("✅ Usage: `/finish <idea number>`\nUse `/ideas` to see numbers.")
+        return
+    
+    try:
+        idea_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Please provide a valid idea number.")
+        return
+    
+    for idea in ideas_data:
+        if idea['id'] == idea_id:
+            idea['status'] = 'done'
+            save_ideas()
+            await update.message.reply_text(f"✅ Idea #{idea_id} marked as finished!")
+            return
+    
+    await update.message.reply_text(f"❌ Idea #{idea_id} not found.")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1295,6 +1425,9 @@ def main():
         print("Add telegram.token to your config.yaml")
         sys.exit(1)
     
+    # Load persistent data (user preferences and ideas)
+    load_persistent_data()
+    
     # Register bot commands in Telegram's command menu (shown when typing /)
     from telegram import BotCommand
     
@@ -1310,6 +1443,9 @@ def main():
             BotCommand('speed', 'Run internet speed test'),
             BotCommand('search', 'Search media in library'),
             BotCommand('notify', 'Toggle download alerts'),
+            BotCommand('idea', 'Save a new idea'),
+            BotCommand('ideas', 'List all ideas by day'),
+            BotCommand('finish', 'Mark idea as finished'),
             BotCommand('reboot', 'Reboot the Pi'),
             BotCommand('cancel', 'Cancel current operation'),
         ])
@@ -1350,6 +1486,9 @@ def main():
             CommandHandler('speed', speed_command),
             CommandHandler('search', search_command),
             CommandHandler('notify', notify_command),
+            CommandHandler('idea', idea_command),
+            CommandHandler('ideas', ideas_command),
+            CommandHandler('finish', finish_command),
             CommandHandler('reboot', reboot_command),
             CallbackQueryHandler(reboot_callback, pattern='^reboot_'),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
@@ -1366,11 +1505,14 @@ def main():
     application.add_handler(CommandHandler('speed', speed_command))
     application.add_handler(CommandHandler('search', search_command))
     application.add_handler(CommandHandler('notify', notify_command))
+    application.add_handler(CommandHandler('idea', idea_command))
+    application.add_handler(CommandHandler('ideas', ideas_command))
+    application.add_handler(CommandHandler('finish', finish_command))
     application.add_handler(CommandHandler('reboot', reboot_command))
     
     # Run the bot
     print("Starting Telegram bot...")
-    print("Available commands: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /notify, /reboot, /cancel")
+    print("Available: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /notify, /idea, /ideas, /finish, /reboot, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
