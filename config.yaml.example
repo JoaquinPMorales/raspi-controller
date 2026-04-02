@@ -34,10 +34,17 @@ telegram:
   allowed_users: []             # List of allowed Telegram user IDs (empty = allow all)
                                 # Use /start to see your user ID if unauthorized
 
-# qBittorrent Configuration (optional, for /downloads command)
-# Enable Web UI in qBittorrent: Tools → Options → Web UI → Enable
-qbittorrent:
-  host: "localhost"           # qBittorrent host (usually localhost if on same Pi)
-  port: 8080                  # Web UI port (default 8080)
-  username: "admin"           # Web UI username
-  password: "adminadmin"      # Web UI password
+# WiFi Monitor Configuration (optional)
+# Monitors WiFi connectivity and reconnects if needed
+wifi:
+  enabled: true                  # Set to false to disable WiFi monitoring
+  check_host: "8.8.8.8"         # Host to ping for connectivity check
+  check_timeout: 5              # Ping timeout in seconds
+  restart_manager: true           # Restart NetworkManager on failure
+  # Primary WiFi to connect to when reconnecting
+  primary_ssid: "YourPrimaryWiFi"
+  primary_password: null          # Password for primary WiFi (optional if saved in NetworkManager)
+  # Fallback WiFi if primary is unavailable
+  fallback_ssid: "YourFallbackWiFi"
+  fallback_password: null         # Password for fallback WiFi (optional)
+

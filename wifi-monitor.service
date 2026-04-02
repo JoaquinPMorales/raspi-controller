@@ -1,0 +1,16 @@
+[Unit]
+Description=WiFi Monitor - Check connectivity and reconnect if needed
+After=network.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/wifi_monitor/wifi_monitor.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wifi-monitor
+
+[Install]
+WantedBy=multi-user.target

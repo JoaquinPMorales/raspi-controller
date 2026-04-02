@@ -1,0 +1,10 @@
+[Unit]
+Description=Run WiFi Monitor periodically
+Requires=wifi-monitor.service
+
+[Timer]
+OnCalendar=*:*:0/30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
