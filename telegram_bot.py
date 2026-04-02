@@ -644,7 +644,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/downloads - Show active downloads\n"
         "/pause - Pause all downloads\n"
         "/speed - Run internet speed test\n"
-        "/search - Search media in library (e.g. /search Batman)\n"
+        "/search - Search downloads folder (e.g. /search Batman)\n"
         "/notify - Toggle download finish alerts\n"
         "/idea - Save a new idea (e.g. /idea Buy more storage)\n"
         "/ideas - List all ideas by day\n"
@@ -1196,7 +1196,7 @@ async def speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Search for media in Jellyfin library."""
+    """Search for media in downloads folder."""
     config = context.bot_data.get('config')
     allowed_users = config.get('telegram', {}).get('allowed_users', [])
     user_id = update.effective_user.id
@@ -1210,7 +1210,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     
     query = ' '.join(context.args).lower()
-    await update.message.reply_text(f"🔍 Searching for '*{query}*'...", parse_mode='Markdown')
+    await update.message.reply_text(f"🔍 Searching downloads for '*{query}*'...", parse_mode='Markdown')
     
     import paramiko
     pi_config = config['pi']
@@ -1226,31 +1226,46 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             key_filename=pi_config.get('key_path')
         )
         
-        shows_path = config['paths'].get('jellyfin_shows', '/mnt/media/Shows')
-        movies_path = config['paths'].get('jellyfin_movies', '/mnt/media/Movies')
+        downloads_path = config['paths']['downloads']
+        
+        # Verify path exists
+        _, stdout, _ = ssh.exec_command(f'test -d "{downloads_path}" && echo "ok" || echo "missing"')
+        path_ok = stdout.read().decode().strip() == 'ok'
+        
+        if not path_ok:
+            await update.message.reply_text(
+                f"❌ Downloads path not found on Pi: `{downloads_path}`\n\nCheck `paths.downloads` in config.yaml",
+                parse_mode='Markdown'
+            )
+            ssh.close()
+            return
         
         results = []
+        seen = set()
         
-        stdin, stdout, _ = ssh.exec_command(f'find {shows_path} -maxdepth 3 -type d 2>/dev/null | grep -i "{query}" | head -10')
-        shows_found = stdout.read().decode().strip().splitlines()
-        for show in shows_found:
-            if show and show != shows_path:
-                results.append(f"📺 {show.split('/')[-1]}")
+        # Search directories (TV shows) and files (movies) in downloads
+        _, stdout, _ = ssh.exec_command(f'find "{downloads_path}" -maxdepth 3 \( -type d -o -type f \) 2>/dev/null | grep -iv "sample\\|featurette\\|\\.srt\\|\\.sub\\|\\.nfo\\|\\.jpg\\|\\.png" | grep -i "{query}" | head -15')
         
-        stdin, stdout, _ = ssh.exec_command(f'find {movies_path} -maxdepth 3 -type f 2>/dev/null | grep -i "{query}" | head -10')
-        movies_found = stdout.read().decode().strip().splitlines()
-        for movie in movies_found:
-            if movie:
-                results.append(f"🎬 {movie.split('/')[-1].rsplit('.', 1)[0]}")
+        for item in stdout.read().decode().strip().splitlines():
+            if item and item != downloads_path:
+                name = item.split('/')[-1]
+                # Remove extension for files
+                if '.' in name:
+                    name = name.rsplit('.', 1)[0]
+                if name not in seen:
+                    seen.add(name)
+                    # Determine icon based on whether parent path looks like a show folder
+                    icon = "📺" if item.count('/') > downloads_path.count('/') + 1 else "🎬"
+                    results.append(f"{icon} {name}")
         
         ssh.close()
         
         if results:
-            result_text = f"✅ *Found in library:*\n\n" + "\n".join(results[:10])
-            if len(results) > 10:
-                result_text += f"\n\n... and {len(results) - 10} more"
+            result_text = f"✅ *Found in downloads:*\n\n" + "\n".join(results[:15])
+            if len(results) > 15:
+                result_text += f"\n\n_...and {len(results) - 15} more_"
         else:
-            result_text = f"❌ '*{query}*' not found in library"
+            result_text = f"❌ '*{query}*' not found in downloads folder"
         
         await update.message.reply_text(result_text, parse_mode='Markdown')
     except Exception as e:
@@ -1441,7 +1456,7 @@ def main():
             BotCommand('downloads', 'Show qBittorrent download status'),
             BotCommand('pause', 'Pause all downloads'),
             BotCommand('speed', 'Run internet speed test'),
-            BotCommand('search', 'Search media in library'),
+            BotCommand('search', 'Search downloads folder'),
             BotCommand('notify', 'Toggle download alerts'),
             BotCommand('idea', 'Save a new idea'),
             BotCommand('ideas', 'List all ideas by day'),
