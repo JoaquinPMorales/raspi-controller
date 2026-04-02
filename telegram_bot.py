@@ -646,6 +646,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/pause - Pause all downloads\n"
         "/speed - Run internet speed test\n"
         "/search - Search downloads folder (e.g. /search Batman)\n"
+        "/temp - Show CPU temperature\n"
+        "/cpu - Show CPU load and top processes\n"
+        "/memory - Show memory usage\n"
         "/notify - Toggle download finish alerts\n"
         "/idea - Save a new idea (e.g. /idea Buy more storage)\n"
         "/ideas - List all ideas by day\n"
@@ -1405,6 +1408,173 @@ async def finish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(f"❌ Idea #{idea_id} not found.")
 
 
+async def temp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show CPU temperature."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    import paramiko
+    pi_config = config['pi']
+    
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            pi_config['host'],
+            port=pi_config.get('port', 22),
+            username=pi_config['user'],
+            password=pi_config.get('password'),
+            key_filename=pi_config.get('key_path')
+        )
+        
+        # Get temperature
+        _, stdout, _ = ssh.exec_command('cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo "N/A"')
+        temp_raw = stdout.read().decode().strip()
+        
+        if temp_raw != "N/A":
+            temp_c = int(temp_raw) / 1000
+            # Determine status
+            if temp_c < 60:
+                status = "✅ Normal"
+                icon = "🌡️"
+            elif temp_c < 75:
+                status = "⚠️ Warm"
+                icon = "🌡️"
+            elif temp_c < 85:
+                status = "🔥 Hot"
+                icon = "🌡️"
+            else:
+                status = "❌ Critical"
+                icon = "🌡️"
+            
+            result = f"{icon} *CPU Temperature*\n\n{temp_c:.1f}°C ({temp_c * 9/5 + 32:.1f}°F)\n{status}"
+        else:
+            result = "❌ Could not read temperature sensor"
+        
+        ssh.close()
+        await update.message.reply_text(result, parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
+
+
+async def cpu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show CPU load and processes."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    import paramiko
+    pi_config = config['pi']
+    
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            pi_config['host'],
+            port=pi_config.get('port', 22),
+            username=pi_config['user'],
+            password=pi_config.get('password'),
+            key_filename=pi_config.get('key_path')
+        )
+        
+        # Get CPU info
+        _, stdout, _ = ssh.exec_command("uptime | awk -F'load average:' '{print $2}'")
+        load_avg = stdout.read().decode().strip()
+        
+        _, stdout, _ = ssh.exec_command("nproc")
+        cores = stdout.read().decode().strip()
+        
+        # Get CPU usage percentage
+        _, stdout, _ = ssh.exec_command("top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1")
+        cpu_percent = stdout.read().decode().strip()
+        
+        # Get top processes
+        _, stdout, _ = ssh.exec_command("ps aux --sort=-%cpu | head -6 | tail -5 | awk '{printf \"%.1f%% %s\\n\", $3, $11}'")
+        top_processes = stdout.read().decode().strip()
+        
+        result = f"⚙️ *CPU Status*\n\n"
+        result += f"*Load Average:* {load_avg}\n"
+        result += f"*Cores:* {cores}\n"
+        if cpu_percent:
+            result += f"*Usage:* {cpu_percent}%\n\n"
+        result += f"*Top Processes:*\n```{top_processes}```"
+        
+        ssh.close()
+        await update.message.reply_text(result, parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show memory usage."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    import paramiko
+    pi_config = config['pi']
+    
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            pi_config['host'],
+            port=pi_config.get('port', 22),
+            username=pi_config['user'],
+            password=pi_config.get('password'),
+            key_filename=pi_config.get('key_path')
+        )
+        
+        # Get memory info
+        _, stdout, _ = ssh.exec_command("free -h | grep '^Mem:'")
+        mem_line = stdout.read().decode().strip()
+        
+        if mem_line:
+            parts = mem_line.split()
+            total = parts[1]
+            used = parts[2]
+            free = parts[3]
+            shared = parts[4]
+            buff_cache = parts[5]
+            available = parts[6]
+            
+            # Calculate percentage
+            _, stdout, _ = ssh.exec_command("free | grep '^Mem:' | awk '{printf \"%.0f\", $3/$2 * 100.0}'")
+            used_percent = stdout.read().decode().strip()
+            
+            # Progress bar
+            filled = int(int(used_percent) / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            
+            result = f"🧠 *Memory Usage*\n\n"
+            result += f"{bar} {used_percent}%\n\n"
+            result += f"*Total:* {total}\n"
+            result += f"*Used:* {used}\n"
+            result += f"*Free:* {free}\n"
+            result += f"*Available:* {available}\n"
+            result += f"*Cache:* {buff_cache}"
+        else:
+            result = "❌ Could not read memory info"
+        
+        ssh.close()
+        await update.message.reply_text(result, parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show disk space status."""
     config = context.bot_data.get('config')
@@ -1474,6 +1644,9 @@ def main():
             BotCommand('pause', 'Pause all downloads'),
             BotCommand('speed', 'Run internet speed test'),
             BotCommand('search', 'Search downloads folder'),
+            BotCommand('temp', 'Show CPU temperature'),
+            BotCommand('cpu', 'Show CPU load and processes'),
+            BotCommand('memory', 'Show memory usage'),
             BotCommand('notify', 'Toggle download alerts'),
             BotCommand('idea', 'Save a new idea'),
             BotCommand('ideas', 'List all ideas by day'),
@@ -1518,6 +1691,9 @@ def main():
             CommandHandler('speed', speed_command),
             CommandHandler('search', search_command),
             CommandHandler('notify', notify_command),
+            CommandHandler('temp', temp_command),
+            CommandHandler('cpu', cpu_command),
+            CommandHandler('memory', memory_command),
             CommandHandler('idea', idea_command),
             CommandHandler('ideas', ideas_command),
             CommandHandler('finish', finish_command),
@@ -1537,6 +1713,9 @@ def main():
     application.add_handler(CommandHandler('speed', speed_command))
     application.add_handler(CommandHandler('search', search_command))
     application.add_handler(CommandHandler('notify', notify_command))
+    application.add_handler(CommandHandler('temp', temp_command))
+    application.add_handler(CommandHandler('cpu', cpu_command))
+    application.add_handler(CommandHandler('memory', memory_command))
     application.add_handler(CommandHandler('idea', idea_command))
     application.add_handler(CommandHandler('ideas', ideas_command))
     application.add_handler(CommandHandler('finish', finish_command))
@@ -1544,7 +1723,7 @@ def main():
     
     # Run the bot
     print("Starting Telegram bot...")
-    print("Available: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /notify, /idea, /ideas, /finish, /reboot, /cancel")
+    print("Available: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /temp, /cpu, /memory, /notify, /idea, /ideas, /finish, /reboot, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
