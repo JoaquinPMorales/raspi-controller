@@ -336,14 +336,121 @@ Type `/` in Telegram to see the command menu, or use any of these:
 | `/status` | Check disk space on all mounted volumes |
 | `/health` | Check disk health with SMART data (temperature, wear %, power-on hours) |
 | `/services` | Check if Jellyfin, qBittorrent, Plex, and Samba are running |
+| `/downloads` | Show active qBittorrent downloads |
+| `/pause` | Pause all downloads |
+| `/speed` | Run internet speed test |
+| `/search` | Search downloads folder for media |
+| `/temp` | Show CPU temperature |
+| `/cpu` | Show CPU load and processes |
+| `/memory` | Show RAM usage |
+| `/backup` | Run system backup manually |
+| `/backupstatus` | Show backup status and next due date |
+| `/backupsetup` | Google Drive backup setup instructions |
 | `/reboot` | Reboot the Pi remotely (requires confirmation) |
 | `/help` | Show all available commands and usage tips |
 | `/cancel` | Cancel current operation |
 
-**Tips:**
+**System Monitoring Tips:**
 - Use `/health` regularly to monitor drive wear on SSDs
 - `/services` is useful when Jellyfin isn't responding — check if it crashed
-- `/reboot` shows confirmation buttons to prevent accidental restarts during active copies
+- `/temp`, `/cpu`, `/memory` help diagnose performance issues
+- `/backupstatus` shows when your last system backup was made
+
+### System Backup to Google Drive
+
+The bot can create full SD card backups and upload them to Google Drive using rclone.
+
+#### What it does
+- Creates compressed image of your SD card (`dd` + `gzip`)
+- Saves locally to configured path (e.g., `/mnt/storage/backups`)
+- Uploads to Google Drive via rclone
+- Keeps only the latest backup (auto-deletes old ones)
+- Runs automatically every 30 days (if enabled)
+
+#### Setup
+
+1. **Enable backups in `config.yaml`:**
+   ```yaml
+   backup:
+     enabled: true
+     source_device: "/dev/mmcblk0"  # Your SD card device
+     local_path: "/mnt/storage/backups"
+     cloud_enabled: true
+     cloud_remote: "gdrive:Backups"
+     auto_backup: true  # Run automatically every 30 days
+   ```
+
+2. **Install rclone:**
+   ```bash
+   sudo apt update && sudo apt install rclone
+   ```
+
+3. **Configure Google Drive:**
+   ```bash
+   rclone config
+   ```
+   
+   Interactive setup:
+   - Type `n` for new remote
+   - Name: `gdrive`
+   - Select `13` (Google Drive) or type `drive`
+   - Client ID: Press Enter (use default)
+   - Client Secret: Press Enter (use default)
+   - Scope: `1` (Full access)
+   - Root folder ID: Press Enter
+   - Service account: Press Enter
+   - Edit advanced config: `n`
+   - Use auto config: `y` (opens browser for OAuth)
+   - Follow browser authentication
+   - Configure as shared drive: `n`
+   - Confirm: `y`
+
+4. **Create backup folder in Google Drive:**
+   - Go to [drive.google.com](https://drive.google.com)
+   - Create a folder named `Backups`
+
+5. **Test the connection:**
+   ```bash
+   rclone listremotes
+   # Should show: gdrive:
+   
+   rclone lsd gdrive:
+   # Should list your Drive folders
+   
+   rclone mkdir gdrive:Backups
+   # Creates the backup folder
+   ```
+
+6. **Run your first backup:**
+   In Telegram, send `/backup` to the bot. The first backup takes 15-30 minutes.
+
+7. **Check status anytime:**
+   Send `/backupstatus` to see:
+   - Last backup date and file size
+   - Days until next scheduled backup
+   - Cloud sync status
+
+#### Troubleshooting
+
+**rclone not found:**
+```bash
+sudo apt install rclone
+```
+
+**Authentication failed:**
+- Re-run `rclone config`
+- Make sure you're using the same Google account
+- Check that the OAuth flow completed in browser
+
+**Upload timeouts:**
+- Large backups (>20GB) may take hours to upload
+- The bot will continue in background and notify when done
+- Check status with `/backupstatus`
+
+**"gdrive" remote not found:**
+- Verify `rclone listremotes` shows `gdrive:`
+- Check `config.yaml` has `cloud_remote: "gdrive:Backups"`
+- Make sure the `:` is included in the remote name
 
 ### Running the Bot as a Service (Auto-start on boot)
 
