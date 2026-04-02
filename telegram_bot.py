@@ -1251,7 +1251,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         seen_titles = set()
         
         # Find all matching items
-        _, stdout, _ = ssh.exec_command(f'find "{downloads_path}" -maxdepth 3 \( -type d -o -type f \) 2>/dev/null | grep -iv "sample\\|featurette\\|\\.srt\\|\\.sub\\|\\.nfo\\|\\.jpg\\|\\.png" | grep -i "{query}" | head -30')
+        _, stdout, _ = ssh.exec_command(rf'find "{downloads_path}" -maxdepth 3 \( -type d -o -type f \) 2>/dev/null | grep -iv "sample\|featurette\|\.srt\|\.sub\|\.nfo\|\.jpg\|\.png" | grep -i "{query}" | head -30')
         
         for item in stdout.read().decode().strip().splitlines():
             if not item or item == downloads_path:
@@ -1755,49 +1755,49 @@ def main():
             BotCommand('reboot', 'Reboot the Pi'),
             BotCommand('cancel', 'Cancel current operation'),
         ])
+        
+        # Start auto-backup scheduler if enabled (runs after event loop starts)
+        backup_config = config.get('backup', {})
+        if backup_config.get('enabled', False) and backup_config.get('auto_backup', True):
+            async def auto_backup_scheduler():
+                """Run monthly backup check in background."""
+                from backup import SystemBackup
+                
+                while True:
+                    try:
+                        backup = SystemBackup(config)
+                        if backup.needs_backup():
+                            logger.info("Monthly backup is due, starting auto-backup...")
+                            success, msg = backup.create_backup()
+                            if success:
+                                logger.info(f"Auto-backup completed: {msg}")
+                                # Notify all users with notifications enabled
+                                for uid, data in user_data.items():
+                                    if data.get('notifications', False):
+                                        try:
+                                            await app.bot.send_message(
+                                                uid,
+                                                f"📦 *Monthly Auto-Backup Completed*\n\n{msg}",
+                                                parse_mode='Markdown'
+                                            )
+                                        except Exception as e:
+                                            logger.warning(f"Failed to notify user {uid}: {e}")
+                            else:
+                                logger.error(f"Auto-backup failed: {msg}")
+                        
+                        # Check again in 24 hours
+                        await asyncio.sleep(86400)
+                    except Exception as e:
+                        logger.error(f"Backup scheduler error: {e}")
+                        await asyncio.sleep(3600)  # Wait 1 hour on error
+            
+            # Start the scheduler as a background task
+            app.create_task(auto_backup_scheduler())
+            logger.info("Auto-backup scheduler started (checking daily)")
     
     # Create application with post_init hook and store config
     application = Application.builder().token(token).post_init(post_init).build()
     application.bot_data['config'] = config
-    
-    # Start auto-backup scheduler if enabled
-    backup_config = config.get('backup', {})
-    if backup_config.get('enabled', False) and backup_config.get('auto_backup', True):
-        async def auto_backup_scheduler(app):
-            """Run monthly backup check in background."""
-            from backup import SystemBackup
-            
-            while True:
-                try:
-                    backup = SystemBackup(config)
-                    if backup.needs_backup():
-                        logger.info("Monthly backup is due, starting auto-backup...")
-                        success, msg = backup.create_backup()
-                        if success:
-                            logger.info(f"Auto-backup completed: {msg}")
-                            # Notify all users with notifications enabled
-                            for uid, data in user_data.items():
-                                if data.get('notifications', False):
-                                    try:
-                                        await app.bot.send_message(
-                                            uid,
-                                            f"📦 *Monthly Auto-Backup Completed*\n\n{msg}",
-                                            parse_mode='Markdown'
-                                        )
-                                    except Exception as e:
-                                        logger.warning(f"Failed to notify user {uid}: {e}")
-                        else:
-                            logger.error(f"Auto-backup failed: {msg}")
-                    
-                    # Check again in 24 hours
-                    await asyncio.sleep(86400)
-                except Exception as e:
-                    logger.error(f"Backup scheduler error: {e}")
-                    await asyncio.sleep(3600)  # Wait 1 hour on error
-        
-        # Start the scheduler as a background task
-        application.create_task(auto_backup_scheduler(application))
-        logger.info("Auto-backup scheduler started (checking daily)")
     
     # Conversation handler
     conv_handler = ConversationHandler(
