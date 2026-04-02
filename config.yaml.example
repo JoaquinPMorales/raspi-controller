@@ -48,3 +48,14 @@ wifi:
   fallback_ssid: "YourFallbackWiFi"
   fallback_password: null         # Password for fallback WiFi (optional)
 
+# Backup Configuration (optional)
+# Creates monthly system backups of the SD card
+backup:
+  enabled: false                  # Set to true to enable backups
+  source_device: "/dev/mmcblk0"  # SD card device to backup
+  local_path: "/mnt/storage/backups"  # Where to store backups locally
+  cloud_enabled: false            # Upload to cloud storage via rclone
+  cloud_remote: "gdrive:Backups" # rclone remote path (e.g., gdrive:Backups)
+  auto_backup: true               # Run backup automatically when due (30 days)
+  # To set up Google Drive: https://rclone.org/drive/
+

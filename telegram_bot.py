@@ -649,6 +649,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/temp - Show CPU temperature\n"
         "/cpu - Show CPU load and top processes\n"
         "/memory - Show memory usage\n"
+        "/backup - Run system backup manually\n"
+        "/backupstatus - Show backup status and next scheduled\n"
+        "/backupsetup - Cloud backup setup guide\n"
         "/notify - Toggle download finish alerts\n"
         "/idea - Save a new idea (e.g. /idea Buy more storage)\n"
         "/ideas - List all ideas by day\n"
@@ -1575,6 +1578,101 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
 
 
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run system backup manually."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    backup_config = config.get('backup', {})
+    if not backup_config.get('enabled', False):
+        await update.message.reply_text(
+            "⚠️ Backups not enabled.\n\n"
+            "Add to config.yaml:\n"
+            "```\nbackup:\n  enabled: true\n  source_device: /dev/mmcblk0\n  local_path: /mnt/storage/backups\n```",
+            parse_mode='Markdown'
+        )
+        return
+    
+    from backup import SystemBackup
+    backup = SystemBackup(config)
+    
+    # Send initial message
+    message = await update.message.reply_text("📦 Starting backup... This may take 15-30 minutes.")
+    
+    async def progress_callback(msg):
+        try:
+            await message.edit_text(f"📦 {msg}")
+        except Exception:
+            pass  # Ignore edit errors
+    
+    # Run backup in executor to not block
+    loop = asyncio.get_event_loop()
+    success, result_msg = await loop.run_in_executor(
+        None, 
+        lambda: backup.create_backup(lambda msg: asyncio.run_coroutine_threadsafe(progress_callback(msg), loop))
+    )
+    
+    if success:
+        await message.edit_text(f"✅ {result_msg}\n\nNext backup due in 30 days.")
+        
+        # Notify if configured
+        if user_data.get(user_id, {}).get('notifications', False):
+            # Could send additional notification
+            pass
+    else:
+        await message.edit_text(f"❌ {result_msg}")
+
+
+async def backupstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show backup status and next scheduled backup."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    backup_config = config.get('backup', {})
+    if not backup_config.get('enabled', False):
+        await update.message.reply_text(
+            "⚠️ Backups not enabled.\n\n"
+            "Add to config.yaml:\n"
+            "```\nbackup:\n  enabled: true\n  source_device: /dev/mmcblk0\n  local_path: /mnt/storage/backups\n```",
+            parse_mode='Markdown'
+        )
+        return
+    
+    from backup import SystemBackup
+    backup = SystemBackup(config)
+    status_text = backup.get_status_text()
+    await update.message.reply_text(status_text, parse_mode='Markdown')
+
+
+async def backupsetup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show setup instructions for cloud backups."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    from backup import setup_rclone_instructions
+    instructions = setup_rclone_instructions()
+    
+    await update.message.reply_text(
+        f"📋 *Google Drive Backup Setup*\n\n{instructions}",
+        parse_mode='Markdown'
+    )
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show disk space status."""
     config = context.bot_data.get('config')
@@ -1647,6 +1745,9 @@ def main():
             BotCommand('temp', 'Show CPU temperature'),
             BotCommand('cpu', 'Show CPU load and processes'),
             BotCommand('memory', 'Show memory usage'),
+            BotCommand('backup', 'Run system backup'),
+            BotCommand('backupstatus', 'Show backup status'),
+            BotCommand('backupsetup', 'Cloud backup setup'),
             BotCommand('notify', 'Toggle download alerts'),
             BotCommand('idea', 'Save a new idea'),
             BotCommand('ideas', 'List all ideas by day'),
@@ -1658,6 +1759,45 @@ def main():
     # Create application with post_init hook and store config
     application = Application.builder().token(token).post_init(post_init).build()
     application.bot_data['config'] = config
+    
+    # Start auto-backup scheduler if enabled
+    backup_config = config.get('backup', {})
+    if backup_config.get('enabled', False) and backup_config.get('auto_backup', True):
+        async def auto_backup_scheduler(app):
+            """Run monthly backup check in background."""
+            from backup import SystemBackup
+            
+            while True:
+                try:
+                    backup = SystemBackup(config)
+                    if backup.needs_backup():
+                        logger.info("Monthly backup is due, starting auto-backup...")
+                        success, msg = backup.create_backup()
+                        if success:
+                            logger.info(f"Auto-backup completed: {msg}")
+                            # Notify all users with notifications enabled
+                            for uid, data in user_data.items():
+                                if data.get('notifications', False):
+                                    try:
+                                        await app.bot.send_message(
+                                            uid,
+                                            f"📦 *Monthly Auto-Backup Completed*\n\n{msg}",
+                                            parse_mode='Markdown'
+                                        )
+                                    except Exception as e:
+                                        logger.warning(f"Failed to notify user {uid}: {e}")
+                        else:
+                            logger.error(f"Auto-backup failed: {msg}")
+                    
+                    # Check again in 24 hours
+                    await asyncio.sleep(86400)
+                except Exception as e:
+                    logger.error(f"Backup scheduler error: {e}")
+                    await asyncio.sleep(3600)  # Wait 1 hour on error
+        
+        # Start the scheduler as a background task
+        application.create_task(auto_backup_scheduler(application))
+        logger.info("Auto-backup scheduler started (checking daily)")
     
     # Conversation handler
     conv_handler = ConversationHandler(
@@ -1694,6 +1834,9 @@ def main():
             CommandHandler('temp', temp_command),
             CommandHandler('cpu', cpu_command),
             CommandHandler('memory', memory_command),
+            CommandHandler('backup', backup_command),
+            CommandHandler('backupstatus', backupstatus_command),
+            CommandHandler('backupsetup', backupsetup_command),
             CommandHandler('idea', idea_command),
             CommandHandler('ideas', ideas_command),
             CommandHandler('finish', finish_command),
@@ -1716,6 +1859,9 @@ def main():
     application.add_handler(CommandHandler('temp', temp_command))
     application.add_handler(CommandHandler('cpu', cpu_command))
     application.add_handler(CommandHandler('memory', memory_command))
+    application.add_handler(CommandHandler('backup', backup_command))
+    application.add_handler(CommandHandler('backupstatus', backupstatus_command))
+    application.add_handler(CommandHandler('backupsetup', backupsetup_command))
     application.add_handler(CommandHandler('idea', idea_command))
     application.add_handler(CommandHandler('ideas', ideas_command))
     application.add_handler(CommandHandler('finish', finish_command))
@@ -1723,7 +1869,7 @@ def main():
     
     # Run the bot
     print("Starting Telegram bot...")
-    print("Available: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /temp, /cpu, /memory, /notify, /idea, /ideas, /finish, /reboot, /cancel")
+    print("Available: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /temp, /cpu, /memory, /backup, /backupstatus, /backupsetup, /notify, /idea, /ideas, /finish, /reboot, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
