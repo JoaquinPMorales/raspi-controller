@@ -5,6 +5,7 @@ Run this on your Raspberry Pi to control media operations from your phone.
 
 import os
 import sys
+import re
 import yaml
 import json
 import logging
@@ -1241,22 +1242,38 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         
         results = []
-        seen = set()
+        seen_titles = set()
         
-        # Search directories (TV shows) and files (movies) in downloads
-        _, stdout, _ = ssh.exec_command(f'find "{downloads_path}" -maxdepth 3 \( -type d -o -type f \) 2>/dev/null | grep -iv "sample\\|featurette\\|\\.srt\\|\\.sub\\|\\.nfo\\|\\.jpg\\|\\.png" | grep -i "{query}" | head -15')
+        # Find all matching items
+        _, stdout, _ = ssh.exec_command(f'find "{downloads_path}" -maxdepth 3 \( -type d -o -type f \) 2>/dev/null | grep -iv "sample\\|featurette\\|\\.srt\\|\\.sub\\|\\.nfo\\|\\.jpg\\|\\.png" | grep -i "{query}" | head -30')
         
         for item in stdout.read().decode().strip().splitlines():
-            if item and item != downloads_path:
-                name = item.split('/')[-1]
-                # Remove extension for files
-                if '.' in name:
-                    name = name.rsplit('.', 1)[0]
-                if name not in seen:
-                    seen.add(name)
-                    # Determine icon based on whether parent path looks like a show folder
-                    icon = "📺" if item.count('/') > downloads_path.count('/') + 1 else "🎬"
-                    results.append(f"{icon} {name}")
+            if not item or item == downloads_path:
+                continue
+            
+            # Get the relative path from downloads
+            rel_path = item[len(downloads_path):].lstrip('/')
+            parts = rel_path.split('/')
+            
+            # Extract title: first folder for shows, parent folder or filename for movies
+            if len(parts) >= 2 and '.' not in parts[0]:
+                # It's a show folder with seasons/episodes inside
+                title = parts[0]
+                icon = "📺"
+            else:
+                # It's a movie file or loose file
+                title = parts[0]
+                # Remove year and quality tags like (2023), [1080p], etc.
+                title = re.sub(r'[\(\[\{]\d{4}[\)\]\}]', '', title)  # Remove (2023) [2023] {2023}
+                title = re.sub(r'[\(\[\{].*?[\)\]\}]', '', title)   # Remove [1080p] (WEB-DL) etc
+                title = title.replace('.', ' ').replace('_', ' ').strip()
+                icon = "🎬"
+            
+            # Normalize for deduplication
+            clean_title = ' '.join(title.lower().split())
+            if clean_title and clean_title not in seen_titles:
+                seen_titles.add(clean_title)
+                results.append(f"{icon} {title.strip()}")
         
         ssh.close()
         
