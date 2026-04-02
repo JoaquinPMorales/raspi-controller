@@ -48,6 +48,14 @@ wifi:
   fallback_ssid: "YourFallbackWiFi"
   fallback_password: null         # Password for fallback WiFi (optional)
 
+# TMDB API Configuration (optional)
+# Used to fetch missing year for TV shows/movies when not in folder name
+# Get free API key from: https://www.themoviedb.org/settings/api
+tmdb:
+  api_key: null                   # Your TMDB API key (e.g., "a1b2c3d4...")
+  # With API key, shows like "Breaking Bad S01" will auto-fetch year (2008)
+  # Without it, shows work fine but parent folder won't have year: "Breaking Bad/Season 01"
+
 # Backup Configuration (optional)
 # Creates monthly system backups of the SD card
 backup:

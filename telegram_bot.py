@@ -154,7 +154,8 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
     
     config = user_data[user_id]['config']
-    scanner = FolderScanner(config['pi'])
+    tmdb_key = config.get('tmdb', {}).get('api_key')
+    scanner = FolderScanner(config['pi'], tmdb_api_key=tmdb_key)
     
     if not scanner.connect():
         await query.edit_message_text(

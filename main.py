@@ -351,7 +351,8 @@ def main():
     
     # Connect to Raspberry Pi
     console.print("\n[blue]Connecting to Raspberry Pi...[/blue]")
-    scanner = FolderScanner(config['pi'])
+    tmdb_key = config.get('tmdb', {}).get('api_key')
+    scanner = FolderScanner(config['pi'], tmdb_api_key=tmdb_key)
     
     if not scanner.connect():
         console.print("[red]Failed to connect to Raspberry Pi. Check your configuration.[/red]")
