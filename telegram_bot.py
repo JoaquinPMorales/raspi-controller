@@ -359,8 +359,14 @@ async def confirm_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     space_ok = total_size <= dest_free
     space_emoji = "✅" if space_ok else "⚠️"
     
+    # Check dry-run mode
+    dry_run = user_data[user_id].get('dry_run', config.get('options', {}).get('dry_run', False))
+    dry_run_emoji = "🧪" if dry_run else "▶️"
+    dry_run_text = "DRY-RUN (Preview only)" if dry_run else "LIVE (Will copy files)"
+    
     summary = (
         f"📊 *Selection Summary*\n\n"
+        f"{dry_run_emoji} *Mode:* {dry_run_text}\n"
         f"Selected: {len(selected)} item(s)\n"
         f"  📺 TV Shows: {tv_count}\n"
         f"  🎬 Movies: {movie_count}\n"
@@ -419,14 +425,21 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user_id = update.effective_user.id
     scanner = user_data[user_id]['scanner']
     
+    # Get dry-run mode for this user
+    dry_run = user_data[user_id].get('dry_run', config.get('options', {}).get('dry_run', False))
+    
     try:
+        # Create copier options with dry_run flag
+        copier_options = dict(config['options'])
+        copier_options['dry_run'] = dry_run
+        
         if mode == 'internal':
-            copier = RsyncCopier(config['pi'], config['paths'], config['options'])
+            copier = RsyncCopier(config['pi'], config['paths'], copier_options)
         else:
             local_paths = {
                 'local_destination': config['paths'].get('local_destination', './downloads')
             }
-            copier = ExternalCopier(config['pi'], local_paths, config['options'])
+            copier = ExternalCopier(config['pi'], local_paths, copier_options)
         
         # Create a simple console-like object for copier
         class TelegramConsole:
@@ -450,13 +463,21 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         success = copier.copy_items(selected, console)
         
         if success:
-            result_text = (
-                "✅ *Copy completed successfully!*\n\n"
-                f"Copied {len(selected)} item(s)"
-            )
+            if dry_run:
+                result_text = (
+                    "🧪 *Dry-Run Preview Completed*\n\n"
+                    f"Previewed {len(selected)} item(s)\n"
+                    "✅ No files were copied (preview only)\n\n"
+                    "Use `/dryrun` to disable preview mode, then copy again."
+                )
+            else:
+                result_text = (
+                    "✅ *Copy completed successfully!*\n\n"
+                    f"Copied {len(selected)} item(s)"
+                )
             
-            # Refresh Jellyfin for internal mode
-            if mode == 'internal':
+            # Refresh Jellyfin for internal mode (skip in dry-run)
+            if mode == 'internal' and not dry_run:
                 result_text += "\n🔄 Refreshing Jellyfin library..."
                 await query.message.edit_text(result_text)
                 
@@ -654,6 +675,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/backupstatus - Show backup status and next scheduled\n"
         "/backupsetup - Cloud backup setup guide\n"
         "/notify - Toggle download finish alerts\n"
+        "/dryrun - Toggle dry-run mode (preview before copying)\n"
         "/idea - Save a new idea (e.g. /idea Buy more storage)\n"
         "/ideas - List all ideas by day\n"
         "/finish - Mark idea as done (e.g. /finish 3)\n"
@@ -1674,6 +1696,35 @@ async def backupsetup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def dryrun_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle dry-run mode for copy operations."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    # Get current dry-run state (default from config)
+    if user_id not in user_data:
+        user_data[user_id] = {}
+    
+    current = user_data[user_id].get('dry_run', config.get('options', {}).get('dry_run', False))
+    new_state = not current
+    user_data[user_id]['dry_run'] = new_state
+    
+    status = "✅ *ENABLED*" if new_state else "❌ *DISABLED*"
+    mode_text = "preview (no files will be copied)" if new_state else "live (files will be copied)"
+    
+    await update.message.reply_text(
+        f"🧪 *Dry-Run Mode*: {status}\n\n"
+        f"Copy operations will run in {mode_text} mode.\n\n"
+        f"Use `/dryrun` again to toggle.",
+        parse_mode='Markdown'
+    )
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show disk space status."""
     config = context.bot_data.get('config')
@@ -1750,6 +1801,7 @@ def main():
             BotCommand('backupstatus', 'Show backup status'),
             BotCommand('backupsetup', 'Cloud backup setup'),
             BotCommand('notify', 'Toggle download alerts'),
+            BotCommand('dryrun', 'Toggle dry-run mode'),
             BotCommand('idea', 'Save a new idea'),
             BotCommand('ideas', 'List all ideas by day'),
             BotCommand('finish', 'Mark idea as finished'),
@@ -1838,6 +1890,7 @@ def main():
             CommandHandler('backup', backup_command),
             CommandHandler('backupstatus', backupstatus_command),
             CommandHandler('backupsetup', backupsetup_command),
+            CommandHandler('dryrun', dryrun_command),
             CommandHandler('idea', idea_command),
             CommandHandler('ideas', ideas_command),
             CommandHandler('finish', finish_command),
@@ -1863,6 +1916,7 @@ def main():
     application.add_handler(CommandHandler('backup', backup_command))
     application.add_handler(CommandHandler('backupstatus', backupstatus_command))
     application.add_handler(CommandHandler('backupsetup', backupsetup_command))
+    application.add_handler(CommandHandler('dryrun', dryrun_command))
     application.add_handler(CommandHandler('idea', idea_command))
     application.add_handler(CommandHandler('ideas', ideas_command))
     application.add_handler(CommandHandler('finish', finish_command))
@@ -1870,7 +1924,7 @@ def main():
     
     # Run the bot
     print("Starting Telegram bot...")
-    print("Available: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /temp, /cpu, /memory, /backup, /backupstatus, /backupsetup, /notify, /idea, /ideas, /finish, /reboot, /cancel")
+    print("Available: /start, /help, /status, /health, /services, /downloads, /pause, /speed, /search, /temp, /cpu, /memory, /backup, /backupstatus, /backupsetup, /notify, /dryrun, /idea, /ideas, /finish, /reboot, /cancel")
     print("Press Ctrl+C to stop")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
