@@ -1,6 +1,14 @@
 # Jellyfin Media Copy
 
-A Python script to copy TV series and movies from qBittorrent downloads to your Jellyfin library on a Raspberry Pi. Supports two modes: internal copy within the Pi or external copy to your local laptop.
+A Python tool to copy TV series and movies from qBittorrent downloads to your Jellyfin library on a Raspberry Pi.
+
+**Two ways to use it:**
+1. **Telegram Bot** — Control everything from your phone (recommended for daily use)
+2. **Terminal Script** — Interactive TUI for direct control from your computer
+
+Both support two operation modes:
+- **Internal**: Copy files within the Raspberry Pi (downloads → Jellyfin library)
+- **External**: Copy files from Raspberry Pi to your local laptop
 
 ## Features
 
@@ -104,16 +112,35 @@ pi:
 
 ## Usage
 
-### Basic Usage
+Choose how you want to control the tool:
 
-Activate the virtual environment and run:
+### Option 1: Telegram Bot (Recommended)
 
+Control everything from your phone. Great for managing downloads while away from your computer.
+
+**Setup:** See [Telegram Bot](#telegram-bot-control-from-your-phone) section below.
+
+**Daily use:**
+1. Open Telegram, message your bot
+2. Send `/start` to begin
+3. Select mode and content
+4. Watch progress updates in real-time
+
+### Option 2: Terminal Script
+
+Run directly on your computer with an interactive terminal interface.
+
+**Start the script:**
 ```bash
 source venv/bin/activate
 python main.py
 ```
 
-### Operation Modes
+**Follow the prompts:**
+1. Select operation mode (Internal/External/Maintenance)
+2. Choose content to copy (checkbox interface)
+3. Confirm and execute
+4. Watch progress bars in the terminal
 
 When you start the script, you'll be prompted to select a mode:
 
