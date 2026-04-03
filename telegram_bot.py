@@ -446,6 +446,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
             def __init__(self, message, context):
                 self.message = message
                 self.context = context
+                self._time = 0
             
             def print(self, text):
                 # Strip rich formatting tags
@@ -458,6 +459,15 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             f"{self.message.text}\n{clean_text}"
                         )
                     )
+            
+            def get_time(self):
+                """Return monotonic time for Rich Progress compatibility."""
+                import time
+                return time.monotonic()
+            
+            def log(self, *args, **kwargs):
+                """No-op log method for Rich compatibility."""
+                pass
         
         console = TelegramConsole(query.message, context)
         success = copier.copy_items(selected, console)
