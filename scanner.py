@@ -222,6 +222,11 @@ class FolderScanner:
             # Parse show name and season, detect content type
             show_info = self._parse_show_info(entry.filename)
             
+            # If folder name gave no TV pattern, peek inside to check filenames
+            # e.g. "Rugrats - Aventuras en pañales" contains S01E01 files
+            if is_dir and show_info['content_type'] == 'movie':
+                show_info = self._reclassify_if_tv(full_path, show_info)
+            
             # If year is missing, try to fetch from TMDB
             year = show_info.get('year')
             if not year and self.tmdb_api_key:
@@ -244,6 +249,30 @@ class FolderScanner:
         
         return items
     
+    def _reclassify_if_tv(self, folder_path: str, show_info: Dict) -> Dict:
+        """
+        Peek inside a folder to check if it contains TV episode files.
+        If S##E## or Season ## patterns are found in filenames, reclassify as TV.
+        Returns updated show_info dict.
+        """
+        episode_pattern = re.compile(r'[Ss]\d{1,2}[Ee]\d{1,2}|[Ss]eason\s*\d{1,2}', re.IGNORECASE)
+        try:
+            entries = self.sftp.listdir(folder_path)
+            for filename in entries[:20]:  # Check first 20 entries max
+                if episode_pattern.search(filename):
+                    # Extract season from the first matching file
+                    season_match = re.search(r'[Ss](\d{1,2})[Ee]\d{1,2}', filename)
+                    season = season_match.group(1).zfill(2) if season_match else None
+                    return {
+                        'show': show_info['show'],
+                        'year': show_info['year'],
+                        'season': season,
+                        'content_type': 'tv',
+                    }
+        except Exception:
+            pass
+        return show_info
+
     def _parse_show_info(self, name: str) -> Dict[str, Optional[str]]:
         """
         Parse show/movie name, year, and season number from folder/file name.

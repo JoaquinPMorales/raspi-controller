@@ -48,13 +48,13 @@ class RsyncCopier:
         bwlimit = self.options_config.get('bwlimit')
         preserve = self.options_config.get('preserve_permissions', True)
         
-        flags = ['-avh', '--progress', '--stats']
+        # -rlth: recursive, preserve symlinks, timestamps, human-readable
+        # Explicitly skip permission/owner/group preservation to avoid
+        # 'Operation not permitted' errors on mounted filesystems (NFS, SMB, etc.)
+        flags = ['-rlth', '--progress', '--stats', '--no-perms', '--no-owner', '--no-group']
         
         if dry_run:
             flags.append('--dry-run')
-        
-        if preserve:
-            flags.append('-p')
         
         if bwlimit:
             flags.append(f'--bwlimit={bwlimit}')
