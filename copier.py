@@ -117,11 +117,27 @@ class RsyncCopier:
         """Check if a path is local (not remote SSH path)."""
         return ':' not in path and not path.startswith('//')
 
+    _VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.m4v', '.ts', '.wmv', '.flv', '.webm'}
+
+    def _count_video_files(self, directory: str) -> int:
+        """Count video files directly inside a directory."""
+        try:
+            return sum(
+                1 for e in os.scandir(directory)
+                if e.is_file() and Path(e.name).suffix.lower() in self._VIDEO_EXTENSIONS
+            )
+        except Exception:
+            return 0
+
     def _rsync_local(self, source: str, dest: str, console, progress, task_id, 
                      display_name: str, progress_callback=None) -> bool:
         """Run rsync locally using subprocess (much faster than SSH for local copies)."""
         # Use arg list + shell=False to avoid PATH issues and shell quoting problems
         args = self._build_rsync_args(source.rstrip(), dest.rstrip())
+        
+        # Count episodes/files upfront so we can report X/Y progress
+        ep_total = self._count_video_files(source.rstrip())
+        ep_num = 0
         
         console.print(f"[dim]Executing locally: {' '.join(args)}[/dim]")
         
@@ -140,7 +156,7 @@ class RsyncCopier:
             
             # Notify start
             if progress_callback:
-                progress_callback(0, "", "", "")
+                progress_callback(0, "", "", "", 0, ep_total)
             
             # Read output line by line
             while True:
@@ -154,10 +170,14 @@ class RsyncCopier:
                 
                 line = line.strip()
                 
-                # Parse filename from progress output
+                # Detect new file being transferred (non-indented, non-rsync line)
                 if line and not line[0].isspace() and not line.startswith('rsync'):
                     if not line.startswith('sending') and not line.startswith('receiving'):
-                        current_file = Path(line).name
+                        new_file = Path(line).name
+                        # Count each new video file encountered
+                        if new_file != current_file and Path(new_file).suffix.lower() in self._VIDEO_EXTENSIONS:
+                            ep_num += 1
+                        current_file = new_file
                         progress.update(task_id, description=f"[cyan]{display_name}[/cyan] - {current_file[:40]}")
                 
                 # Parse progress info
@@ -166,7 +186,7 @@ class RsyncCopier:
                     percent = progress_info['percent']
                     progress.update(task_id, completed=percent)
                     if progress_callback:
-                        progress_callback(percent, current_file, progress_info['speed'], progress_info['eta'])
+                        progress_callback(percent, current_file, progress_info['speed'], progress_info['eta'], ep_num, ep_total)
             
             # Wait for completion
             exit_status = process.wait()
@@ -398,12 +418,12 @@ class RsyncCopier:
                 # Track last progress percent to throttle callbacks
                 last_callback_percent = 0
                 
-                def _progress_wrapper(current_percent, filename="", speed="", eta=""):
+                def _progress_wrapper(current_percent, filename="", speed="", eta="", ep_num=0, ep_total=0):
                     nonlocal last_callback_percent
                     # Only call back on 10% increments or first/last
                     if progress_callback and (current_percent == 0 or current_percent >= 100 or 
                                                current_percent - last_callback_percent >= 10):
-                        progress_callback(i, len(items), current_percent, filename or display_name, speed, eta)
+                        progress_callback(i, len(items), current_percent, filename or display_name, speed, eta, ep_num, ep_total)
                         last_callback_percent = current_percent
                 
                 success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper)

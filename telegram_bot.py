@@ -438,6 +438,9 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         'eta': '',
         'filename': '',
         'start_time': _time.time(),
+        'completed': [],  # list of display names already done
+        'ep_num': 0,
+        'ep_total': 0,
     }
     total_items = len(selected)
     _event_loop = asyncio.get_event_loop()
@@ -456,25 +459,43 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         pct = copy_state['percent']
         speed = copy_state['speed']
         eta = copy_state['eta']
+        completed = copy_state['completed']
+        num_done = len(completed)
         
         # Build progress bar string (10 chars wide)
         filled = int(pct / 10)
         bar = '█' * filled + '░' * (10 - filled)
         
-        # Build item line
+        # Current item display name
         item_name = selected[i - 1]['show'] if i > 0 else ''
         if i > 0 and selected[i - 1].get('season'):
             item_name += f" S{selected[i - 1]['season']}"
         
-        lines = [f"📦 *Copying {i}/{total_items}*: {item_name}"]
-        lines.append(f"`{bar}` {pct}%")
-        if speed:
-            lines.append(f"⚡ Speed: `{speed}`")
-        if eta and eta != '0:00:00':
-            lines.append(f"⏱ ETA: `{eta}`")
-        elif not speed:
-            elapsed = int(now - copy_state['start_time'])
-            lines.append(f"⏳ Elapsed: `{elapsed}s`")
+        elapsed = int(now - copy_state['start_time'])
+        
+        ep_num = copy_state['ep_num']
+        ep_total = copy_state['ep_total']
+        
+        lines = [f"📋 *{num_done}/{total_items} items done* — {elapsed}s elapsed"]
+        lines.append("")
+        
+        # Show completed items
+        for name in completed:
+            lines.append(f"✅ {name}")
+        
+        # Show current item in progress
+        if i > 0:
+            cur_item = selected[i - 1]
+            is_tv = cur_item.get('content_type') == 'tv'
+            if is_tv and ep_total > 0:
+                lines.append(f"🔄 *{item_name}* — episode {ep_num}/{ep_total}")
+            else:
+                lines.append(f"🔄 *{item_name}*")
+            lines.append(f"`{bar}` {pct}%")
+            if speed:
+                lines.append(f"⚡ `{speed}`")
+            if eta and eta not in ('0:00:00', ''):
+                lines.append(f"⏱ ETA `{eta}`")
         
         try:
             await query.message.edit_text(
@@ -485,13 +506,35 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
             # Ignore edit conflicts (message not modified)
             pass
     
-    def progress_callback(item_num, total, percent, filename, speed="", eta=""):
+    def progress_callback(item_num, total, percent, filename, speed="", eta="", ep_num=0, ep_total=0):
         """Called by copier from executor thread — schedule coroutine on the event loop."""
+        prev_idx = copy_state['item_idx']
         copy_state['item_idx'] = item_num
         copy_state['percent'] = percent
         copy_state['speed'] = speed
         copy_state['eta'] = eta
         copy_state['filename'] = filename
+        copy_state['ep_num'] = ep_num
+        copy_state['ep_total'] = ep_total
+        
+        # When moving to a new item, mark the previous one as completed
+        if item_num > prev_idx and prev_idx > 0:
+            prev = selected[prev_idx - 1]
+            name = prev['show']
+            if prev.get('season'):
+                name += f" S{prev['season']}"
+            if name not in copy_state['completed']:
+                copy_state['completed'].append(name)
+        
+        # Also mark as complete when percent hits 100 (last item)
+        if percent >= 100:
+            cur = selected[item_num - 1]
+            name = cur['show']
+            if cur.get('season'):
+                name += f" S{cur['season']}"
+            if name not in copy_state['completed']:
+                copy_state['completed'].append(name)
+        
         # Must use run_coroutine_threadsafe since this is called from a thread
         asyncio.run_coroutine_threadsafe(update_progress_message(), _event_loop)
     
