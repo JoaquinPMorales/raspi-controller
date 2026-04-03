@@ -4,6 +4,7 @@ Rsync copier module for copying TV series and movies to Jellyfin with progress m
 
 import os
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -104,6 +105,75 @@ class RsyncCopier:
             dest_base = self.paths_config.get('jellyfin_movies')
             return f"{dest_base}/{show_name}"
     
+    def _is_local_path(self, path: str) -> bool:
+        """Check if a path is local (not remote SSH path)."""
+        return ':' not in path and not path.startswith('//')
+
+    def _rsync_local(self, source: str, dest: str, console, progress, task_id, 
+                     display_name: str, progress_callback=None) -> bool:
+        """Run rsync locally using subprocess (much faster than SSH for local copies)."""
+        rsync_cmd = self._build_rsync_command(f"'{source}/'", f"'{dest}/'")
+        
+        console.print(f"[dim]Executing locally: {rsync_cmd}[/dim]")
+        
+        try:
+            # Start rsync process
+            process = subprocess.Popen(
+                rsync_cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1  # Line buffered
+            )
+            
+            current_file = ""
+            
+            # Notify start
+            if progress_callback:
+                progress_callback(0, "", "", "")
+            
+            # Read output line by line
+            while True:
+                if self.cancelled:
+                    process.terminate()
+                    return False
+                
+                line = process.stdout.readline()
+                if not line:
+                    break
+                
+                line = line.strip()
+                
+                # Parse filename from progress output
+                if line and not line[0].isspace() and not line.startswith('rsync'):
+                    if not line.startswith('sending') and not line.startswith('receiving'):
+                        current_file = Path(line).name
+                        progress.update(task_id, description=f"[cyan]{display_name}[/cyan] - {current_file[:40]}")
+                
+                # Parse progress info
+                progress_info = self._parse_rsync_progress(line)
+                if progress_info:
+                    percent = progress_info['percent']
+                    progress.update(task_id, completed=percent)
+                    if progress_callback:
+                        progress_callback(percent, current_file, progress_info['speed'], progress_info['eta'])
+            
+            # Wait for completion
+            exit_status = process.wait()
+            stderr_output = process.stderr.read()
+            
+            if exit_status == 0:
+                progress.update(task_id, completed=100)
+                return True
+            else:
+                console.print(f"[red]rsync failed (exit {exit_status}): {stderr_output}[/red]")
+                return False
+                
+        except Exception as e:
+            console.print(f"[red]Error during rsync: {e}[/red]")
+            return False
+    
     def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int, progress_callback=None) -> bool:
         """
         Copy a single item (TV season or movie) to Jellyfin with progress monitoring.
@@ -127,6 +197,18 @@ class RsyncCopier:
         else:
             display_name = show_name
         
+        # If both paths are local, use subprocess directly (much faster than SSH)
+        if self._is_local_path(source_path) and self._is_local_path(dest_path):
+            # Ensure destination directory exists locally
+            try:
+                os.makedirs(dest_path, exist_ok=True)
+            except Exception as e:
+                console.print(f"[red]Failed to create destination directory: {e}[/red]")
+                return False
+            # Use fast local rsync without SSH overhead
+            return self._rsync_local(source_path, dest_path, console, progress, task_id, display_name, progress_callback)
+        
+        # Remote copy via SSH
         # Ensure destination directory exists
         mkdir_cmd = f"mkdir -p '{dest_path}'"
         
