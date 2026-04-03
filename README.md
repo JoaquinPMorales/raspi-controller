@@ -57,9 +57,26 @@ paths:
 
 jellyfin:
   api_key: "your-api-key"    # Optional, for auto-refresh
+
+tmdb:
+  api_key: "your-tmdb-api-key"  # Optional, fetches year for better matching
 ```
 
 ## Configuration
+
+### TMDB API Key (Optional)
+
+To automatically fetch release years for better Jellyfin matching:
+
+1. Create a free account at [TMDB](https://www.themoviedb.org/)
+2. Go to **Settings → API** and request an API key
+3. Add it to `config.yaml`:
+   ```yaml
+   tmdb:
+     api_key: "your-tmdb-api-key"
+   ```
+
+This helps Jellyfin correctly identify shows and movies, especially when the folder name doesn't include the year.
 
 ### Jellyfin API Key (Optional)
 
@@ -218,9 +235,9 @@ Possible causes:
 
 /mnt/media/
 ├── Shows/                      # TV shows organized by Jellyfin
-│   ├── Show Name/
+│   ├── Show Name (2023)/
 │   │   └── Season 01/
-│   └── Another Show/
+│   └── Another Show (2022)/
 │       └── Season 02/
 └── Movies/                     # Movies
     └── Movie Name (2023)/
@@ -231,9 +248,9 @@ Possible causes:
 ```
 ./downloads/
 ├── TV/
-│   ├── Show Name/
+│   ├── Show Name (2023)/
 │   │   └── Season 01/
-│   └── Another Show/
+│   └── Another Show (2022)/
 │       └── Season 02/
 └── Movies/
     └── Movie Name (2023)/
@@ -322,7 +339,13 @@ The bot provides an interactive menu:
 1. **Select Mode** - Choose what operation to perform
 2. **Select Content** - Tap items to select/deselect (☑/⬜)
 3. **Confirm** - Review disk space requirements
-4. **Execute** - Copy or update begins, progress updates sent
+5. **Copy Progress** - Real-time updates during copy:
+   - Item X/Y completed
+   - Current file being copied
+   - Progress bar with percentage
+   - Transfer speed (MB/s)
+   - ETA estimate
+   - For TV series: episode X/Y within the season
 
 **Security Note:** The bot only accepts commands from authorized users. If `allowed_users` is empty, anyone with the bot link can use it. For security, always set your user ID.
 
@@ -333,6 +356,7 @@ Type `/` in Telegram to see the command menu, or use any of these:
 | Command | Description |
 |---------|-------------|
 | `/start` | Start media copy operation (opens interactive menu) |
+| `/dryrun` | Toggle dry-run mode (preview without copying) |
 | `/status` | Check disk space on all mounted volumes |
 | `/health` | Check disk health with SMART data (temperature, wear %, power-on hours) |
 | `/services` | Check if Jellyfin, qBittorrent, Plex, and Samba are running |
