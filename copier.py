@@ -104,9 +104,12 @@ class RsyncCopier:
             dest_base = self.paths_config.get('jellyfin_movies')
             return f"{dest_base}/{show_name}"
     
-    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int) -> bool:
+    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int, progress_callback=None) -> bool:
         """
         Copy a single item (TV season or movie) to Jellyfin with progress monitoring.
+        
+        Args:
+            progress_callback: Optional callback(percent, filename) for progress updates
         
         Returns True on success, False on failure.
         """
@@ -173,6 +176,10 @@ class RsyncCopier:
             
             current_file = ""
             
+            # Notify start
+            if progress_callback:
+                progress_callback(0, "", "", "")
+            
             # Read output line by line for progress updates
             while not self.cancelled:
                 line = stdout.readline()
@@ -192,7 +199,12 @@ class RsyncCopier:
                 progress_info = self._parse_rsync_progress(line)
                 if progress_info:
                     percent = progress_info['percent']
+                    speed = progress_info['speed']
+                    eta = progress_info['eta']
                     progress.update(task_id, completed=percent)
+                    # Call back with speed and eta from rsync
+                    if progress_callback:
+                        progress_callback(percent, current_file, speed, eta)
             
             # Check exit status
             exit_status = stdout.channel.recv_exit_status()
@@ -216,9 +228,14 @@ class RsyncCopier:
             console.print(f"[red]Error copying {display_name}: {e}[/red]")
             return False
     
-    def copy_items(self, items: List[Dict], console) -> bool:
+    def copy_items(self, items: List[Dict], console, progress_callback=None) -> bool:
         """
         Copy all selected items to Jellyfin with progress display.
+        
+        Args:
+            items: List of items to copy
+            console: Console-like object for output
+            progress_callback: Optional callback(current, total, percent, filename) for progress updates
         
         Returns True if all items copied successfully, False otherwise.
         """
@@ -283,7 +300,18 @@ class RsyncCopier:
                 
                 console.print(f"\n[bold]{i}/{len(items)}: {display_name}[/bold]")
                 
-                success = self._copy_single_item(item, console, progress, task_id)
+                # Track last progress percent to throttle callbacks
+                last_callback_percent = 0
+                
+                def _progress_wrapper(current_percent, filename="", speed="", eta=""):
+                    nonlocal last_callback_percent
+                    # Only call back on 10% increments or first/last
+                    if progress_callback and (current_percent == 0 or current_percent >= 100 or 
+                                               current_percent - last_callback_percent >= 10):
+                        progress_callback(i, len(items), current_percent, filename or display_name, speed, eta)
+                        last_callback_percent = current_percent
+                
+                success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper)
                 
                 if success:
                     progress.update(overall_task, advance=1)
@@ -517,7 +545,7 @@ class ExternalCopier:
             console.print(f"[red]Error copying directory: {e}[/red]")
             return False
     
-    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int) -> bool:
+    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int, progress_callback=None) -> bool:
         """Copy a single item from Pi to local laptop."""
         source_path = item['path']
         dest_path = self._get_local_destination(item)
@@ -552,7 +580,7 @@ class ExternalCopier:
             console.print(f"[red]Error copying {display_name}: {e}[/red]")
             return False
     
-    def copy_items(self, items: List[Dict], console) -> bool:
+    def copy_items(self, items: List[Dict], console, progress_callback=None) -> bool:
         """Copy all selected items from Pi to local laptop."""
         if not items:
             console.print("[yellow]No items to copy.[/yellow]")
@@ -579,6 +607,7 @@ class ExternalCopier:
             return False
         
         all_success = True
+        total_items = len(items)
         
         # Always use a real Rich Console for Progress internals.
         from rich.console import Console as RichConsole
@@ -625,7 +654,18 @@ class ExternalCopier:
                     
                     console.print(f"\n[bold]{i}/{len(items)}: {display_name}[/bold]")
                     
-                    success = self._copy_single_item(item, console, progress, task_id)
+                    # Track last progress percent to throttle callbacks
+                    last_callback_percent = 0
+                    
+                    def _progress_wrapper(current_percent, filename="", speed="", eta=""):
+                        nonlocal last_callback_percent
+                        # Only call back on 10% increments or first/last
+                        if progress_callback and (current_percent == 0 or current_percent >= 100 or 
+                                                   current_percent - last_callback_percent >= 10):
+                            progress_callback(i, total_items, current_percent, filename or display_name, speed, eta)
+                            last_callback_percent = current_percent
+                    
+                    success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper)
                     
                     if success:
                         progress.update(overall_task, advance=1)

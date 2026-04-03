@@ -407,7 +407,7 @@ async def proceed_copy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await query.edit_message_text(
         f"🚀 Starting {mode.upper()} copy...\n"
         f"Items: {len(selected)}\n"
-        "⏳ Copying... (this may take a while)"
+        "⏳ Connecting and preparing transfer..."
     )
     
     # Run copy in background to not block
@@ -428,6 +428,73 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Get dry-run mode for this user
     dry_run = user_data[user_id].get('dry_run', config.get('options', {}).get('dry_run', False))
     
+    # Progress tracking for Telegram updates
+    import time as _time
+    last_update_time = 0
+    copy_state = {
+        'item_idx': 0,
+        'percent': 0,
+        'speed': '',
+        'eta': '',
+        'filename': '',
+        'start_time': _time.time(),
+    }
+    total_items = len(selected)
+    _event_loop = asyncio.get_event_loop()
+    
+    async def update_progress_message():
+        """Update the Telegram message with current progress."""
+        nonlocal last_update_time
+        
+        now = _time.time()
+        # Throttle updates to every 3 seconds to avoid Telegram rate limits
+        if now - last_update_time < 3:
+            return
+        last_update_time = now
+        
+        i = copy_state['item_idx']
+        pct = copy_state['percent']
+        speed = copy_state['speed']
+        eta = copy_state['eta']
+        
+        # Build progress bar string (10 chars wide)
+        filled = int(pct / 10)
+        bar = '█' * filled + '░' * (10 - filled)
+        
+        # Build item line
+        item_name = selected[i - 1]['show'] if i > 0 else ''
+        if i > 0 and selected[i - 1].get('season'):
+            item_name += f" S{selected[i - 1]['season']}"
+        
+        lines = [f"📦 *Copying {i}/{total_items}*: {item_name}"]
+        lines.append(f"`{bar}` {pct}%")
+        if speed:
+            lines.append(f"⚡ Speed: `{speed}`")
+        if eta and eta != '0:00:00':
+            lines.append(f"⏱ ETA: `{eta}`")
+        elif not speed:
+            elapsed = int(now - copy_state['start_time'])
+            lines.append(f"⏳ Elapsed: `{elapsed}s`")
+        
+        try:
+            await query.message.edit_text(
+                '\n'.join(lines),
+                parse_mode='Markdown'
+            )
+        except Exception:
+            # Ignore edit conflicts (message not modified)
+            pass
+    
+    def progress_callback(item_num, total, percent, filename, speed="", eta=""):
+        """Called by copier from executor thread — schedule coroutine on the event loop."""
+        copy_state['item_idx'] = item_num
+        copy_state['percent'] = percent
+        copy_state['speed'] = speed
+        copy_state['eta'] = eta
+        copy_state['filename'] = filename
+        # Must use run_coroutine_threadsafe since this is called from a thread
+        asyncio.run_coroutine_threadsafe(update_progress_message(), _event_loop)
+    
     try:
         # Create copier options with dry_run flag
         copier_options = dict(config['options'])
@@ -441,26 +508,38 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
             }
             copier = ExternalCopier(config['pi'], local_paths, copier_options)
         
-        # Create a simple console-like object for copier
+        # Create a simple console-like object for copier.
+        # print() is called from an executor thread, so must use run_coroutine_threadsafe.
         class TelegramConsole:
-            def __init__(self, message, context):
+            def __init__(self, message, event_loop):
                 self.message = message
-                self.context = context
+                self._loop = event_loop
             
             def print(self, text):
-                # Strip rich formatting tags
                 import re
-                clean_text = re.sub(r'\[/?[^\]]+\]', '', text)
-                # Don't spam updates, only on significant messages
-                if any(keyword in clean_text.lower() for keyword in ['completed', 'error', 'failed', 'success']):
-                    asyncio.create_task(
-                        self.message.edit_text(
-                            f"{self.message.text}\n{clean_text}"
-                        )
-                    )
+                clean_text = re.sub(r'\[/?[^\]]+\]', '', text).strip()
+                if not clean_text:
+                    return
+                # Always log to stdout/journald
+                logger.info(f"[copier] {clean_text}")
+                # Send errors to Telegram immediately
+                if any(keyword in clean_text.lower() for keyword in ['error', 'failed']):
+                    async def _send():
+                        try:
+                            await self.message.edit_text(f"❌ {clean_text}")
+                        except Exception:
+                            pass
+                    asyncio.run_coroutine_threadsafe(_send(), self._loop)
         
-        console = TelegramConsole(query.message, context)
-        success = copier.copy_items(selected, console)
+        console = TelegramConsole(query.message, _event_loop)
+        
+        # copy_items is synchronous/blocking (SSH + rsync I/O).
+        # Run it in a thread executor so the asyncio event loop stays free
+        # to process progress message updates and other bot events.
+        success = await _event_loop.run_in_executor(
+            None,
+            lambda: copier.copy_items(selected, console, progress_callback=progress_callback)
+        )
         
         if success:
             if dry_run:
@@ -499,7 +578,8 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await query.message.edit_text(result_text, parse_mode='Markdown')
         
     except Exception as e:
-        logger.error(f"Copy error: {e}")
+        import traceback
+        logger.error(f"Copy process failed: {e}\n{traceback.format_exc()}")
         await query.message.edit_text(
             f"❌ *Error during copy:*\n`{str(e)}`",
             parse_mode='Markdown'
