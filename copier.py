@@ -89,14 +89,17 @@ class RsyncCopier:
         """Determine the correct destination path based on content type."""
         content_type = item.get('content_type', 'movie')
         show_name = item['show']
+        year = item.get('year')
         season = item.get('season')
         
         if content_type == 'tv':
             dest_base = self.paths_config.get('jellyfin_shows') or self.paths_config.get('jellyfin_tv')
+            # Jellyfin requires: Show Name (Year)/Season 01
+            folder_name = f"{show_name} ({year})" if year else show_name
             if season:
-                return f"{dest_base}/{show_name}/Season {season}"
+                return f"{dest_base}/{folder_name}/Season {season}"
             else:
-                return f"{dest_base}/{show_name}"
+                return f"{dest_base}/{folder_name}"
         else:
             dest_base = self.paths_config.get('jellyfin_movies')
             return f"{dest_base}/{show_name}"
@@ -205,7 +208,7 @@ class RsyncCopier:
             console.print(f"[red]Error copying {display_name}: {e}[/red]")
             return False
     
-    def copy_items(self, items: List[Dict], console: Console) -> bool:
+    def copy_items(self, items: List[Dict], console) -> bool:
         """
         Copy all selected items to Jellyfin with progress display.
         
@@ -223,6 +226,11 @@ class RsyncCopier:
         
         all_success = True
         
+        # Always use a real Rich Console for Progress internals.
+        # TelegramConsole is not a Rich Console so must not be passed to Progress.
+        from rich.console import Console as RichConsole
+        _progress_console = console if isinstance(console, RichConsole) else RichConsole(file=open(os.devnull, 'w'))
+        
         # Use Rich's Progress for beautiful output
         with Progress(
             SpinnerColumn(),
@@ -233,7 +241,7 @@ class RsyncCopier:
             TimeElapsedColumn(),
             "•",
             TimeRemainingColumn(),
-            console=console,
+            console=_progress_console,
             transient=False,
         ) as progress:
             
@@ -536,7 +544,7 @@ class ExternalCopier:
             console.print(f"[red]Error copying {display_name}: {e}[/red]")
             return False
     
-    def copy_items(self, items: List[Dict], console: Console) -> bool:
+    def copy_items(self, items: List[Dict], console) -> bool:
         """Copy all selected items from Pi to local laptop."""
         if not items:
             console.print("[yellow]No items to copy.[/yellow]")
@@ -564,6 +572,10 @@ class ExternalCopier:
         
         all_success = True
         
+        # Always use a real Rich Console for Progress internals.
+        from rich.console import Console as RichConsole
+        _progress_console = console if isinstance(console, RichConsole) else RichConsole(file=open(os.devnull, 'w'))
+        
         try:
             with Progress(
                 SpinnerColumn(),
@@ -574,7 +586,7 @@ class ExternalCopier:
                 TimeElapsedColumn(),
                 "•",
                 TimeRemainingColumn(),
-                console=console,
+                console=_progress_console,
                 transient=False,
             ) as progress:
                 
