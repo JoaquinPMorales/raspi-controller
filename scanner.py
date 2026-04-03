@@ -221,11 +221,13 @@ class FolderScanner:
             
             # Parse show name and season, detect content type
             show_info = self._parse_show_info(entry.filename)
+            print(f"[DEBUG] Parsed '{entry.filename}': show='{show_info['show']}', year={show_info['year']}, season={show_info['season']}, type={show_info['content_type']}")
             
             # If folder name gave no TV pattern, peek inside to check filenames
             # e.g. "Rugrats - Aventuras en pañales" contains S01E01 files
             if is_dir and show_info['content_type'] == 'movie':
                 show_info = self._reclassify_if_tv(full_path, show_info)
+                print(f"[DEBUG] After reclassify: type={show_info['content_type']}, season={show_info['season']}, year={show_info['year']}")
             
             # If year is missing, try to fetch from TMDB
             year = show_info.get('year')
@@ -234,6 +236,8 @@ class FolderScanner:
                 year = self._get_year_from_tmdb(show_info['show'], is_movie=is_movie)
                 if year:
                     print(f"Fetched year from TMDB: {show_info['show']} ({year})")
+            
+            print(f"[DEBUG] Final item: show='{show_info['show']}', year={year}, season={show_info['season']}, content_type={show_info['content_type']}")
             
             item = {
                 'name': entry.filename,
