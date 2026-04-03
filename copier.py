@@ -151,10 +151,17 @@ class RsyncCopier:
             
             ssh.connect(**connect_kwargs)
             
-            # Create destination directory
-            ssh.exec_command(mkdir_cmd)
+            # Create destination directory and WAIT for it to complete
+            _, mkdir_stdout, mkdir_stderr = ssh.exec_command(mkdir_cmd)
+            mkdir_exit = mkdir_stdout.channel.recv_exit_status()
+            if mkdir_exit != 0:
+                err = mkdir_stderr.read().decode('utf-8', errors='ignore').strip()
+                console.print(f"[red]Failed to create destination directory '{dest_path}': {err}[/red]")
+                ssh.close()
+                return False
             
             # Build and execute rsync command
+            # Note: no get_pty so stderr is kept separate for error capture
             rsync_cmd = self._build_rsync_command(
                 f"'{source_path}/'",
                 f"'{dest_path}/'"
@@ -162,7 +169,7 @@ class RsyncCopier:
             
             console.print(f"[dim]Executing: {rsync_cmd}[/dim]")
             
-            stdin, stdout, stderr = ssh.exec_command(rsync_cmd, get_pty=True)
+            stdin, stdout, stderr = ssh.exec_command(rsync_cmd)
             
             current_file = ""
             
@@ -185,11 +192,11 @@ class RsyncCopier:
                 progress_info = self._parse_rsync_progress(line)
                 if progress_info:
                     percent = progress_info['percent']
-                    speed = progress_info['speed']
                     progress.update(task_id, completed=percent)
             
             # Check exit status
             exit_status = stdout.channel.recv_exit_status()
+            error_output = stderr.read().decode('utf-8', errors='ignore').strip()
             
             ssh.close()
             
@@ -200,8 +207,9 @@ class RsyncCopier:
                 progress.update(task_id, completed=100)
                 return True
             else:
-                error = stderr.read().decode('utf-8', errors='ignore').strip()
-                console.print(f"[red]rsync failed with exit code {exit_status}: {error}[/red]")
+                # Include stderr in error message for diagnosability
+                error_detail = error_output if error_output else "(no stderr output)"
+                console.print(f"[red]rsync failed (exit {exit_status}): {error_detail}[/red]")
                 return False
                 
         except Exception as e:
