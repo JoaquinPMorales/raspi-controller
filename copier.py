@@ -43,16 +43,15 @@ class RsyncCopier:
         """Signal cancellation of ongoing operations."""
         self.cancelled = True
     
-    def _build_rsync_command(self, source: str, destination: str) -> str:
-        """Build rsync command with appropriate options."""
+    def _build_rsync_args(self, source: str, destination: str) -> list:
+        """Build rsync argument list (no shell quoting needed)."""
         dry_run = self.options_config.get('dry_run', False)
         bwlimit = self.options_config.get('bwlimit')
-        preserve = self.options_config.get('preserve_permissions', True)
         
         # -rlth: recursive, preserve symlinks, timestamps, human-readable
         # Explicitly skip permission/owner/group preservation to avoid
         # 'Operation not permitted' errors on mounted filesystems (NFS, SMB, etc.)
-        flags = ['-rlth', '--progress', '--stats', '--no-perms', '--no-owner', '--no-group']
+        flags = ['-rlth', '--progress', '--stats', '--no-perms', '--no-owner', '--no-group', '--partial']
         
         if dry_run:
             flags.append('--dry-run')
@@ -60,11 +59,18 @@ class RsyncCopier:
         if bwlimit:
             flags.append(f'--bwlimit={bwlimit}')
         
-        # Use rsync's partial transfer support for resuming
-        flags.append('--partial')
+        # Ensure source ends with / (copy contents, not folder itself)
+        src = source.rstrip('/') + '/'
+        dst = destination.rstrip('/') + '/'
         
-        cmd = ['rsync'] + flags + [source, destination]
-        return ' '.join(cmd)
+        return ['/usr/bin/rsync'] + flags + [src, dst]
+    
+    def _build_rsync_command(self, source: str, destination: str) -> str:
+        """Build rsync command string (used for SSH remote execution)."""
+        args = self._build_rsync_args(source, destination)
+        # Shell-quote paths (first and last elements)
+        quoted = args[:-2] + [f"'{args[-2]}'", f"'{args[-1]}'"] 
+        return ' '.join(quoted)
     
     def _parse_rsync_progress(self, line: str) -> Optional[Dict]:
         """
@@ -95,7 +101,7 @@ class RsyncCopier:
         
         if content_type == 'tv':
             dest_base = self.paths_config.get('jellyfin_shows') or self.paths_config.get('jellyfin_tv')
-            # Jellyfin requires: Show Name (Year)/Season 01
+            # Jellyfin: Series Name (year)/Season 01
             folder_name = f"{show_name} ({year})" if year else show_name
             if season:
                 return f"{dest_base}/{folder_name}/Season {season}"
@@ -103,7 +109,9 @@ class RsyncCopier:
                 return f"{dest_base}/{folder_name}"
         else:
             dest_base = self.paths_config.get('jellyfin_movies')
-            return f"{dest_base}/{show_name}"
+            # Jellyfin: Movie Name (year)/
+            folder_name = f"{show_name} ({year})" if year else show_name
+            return f"{dest_base}/{folder_name}"
     
     def _is_local_path(self, path: str) -> bool:
         """Check if a path is local (not remote SSH path)."""
@@ -112,15 +120,16 @@ class RsyncCopier:
     def _rsync_local(self, source: str, dest: str, console, progress, task_id, 
                      display_name: str, progress_callback=None) -> bool:
         """Run rsync locally using subprocess (much faster than SSH for local copies)."""
-        rsync_cmd = self._build_rsync_command(f"'{source}/'", f"'{dest}/'")
+        # Use arg list + shell=False to avoid PATH issues and shell quoting problems
+        args = self._build_rsync_args(source.rstrip(), dest.rstrip())
         
-        console.print(f"[dim]Executing locally: {rsync_cmd}[/dim]")
+        console.print(f"[dim]Executing locally: {' '.join(args)}[/dim]")
         
         try:
-            # Start rsync process
+            # Start rsync process — shell=False so PATH is not needed
             process = subprocess.Popen(
-                rsync_cmd,
-                shell=True,
+                args,
+                shell=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -196,6 +205,10 @@ class RsyncCopier:
             display_name = f"{show_name} S{season}"
         else:
             display_name = show_name
+        
+        # Strip any trailing whitespace from paths (folder names may have trailing spaces)
+        source_path = source_path.rstrip()
+        dest_path = dest_path.rstrip()
         
         # If both paths are local, use subprocess directly (much faster than SSH)
         if self._is_local_path(source_path) and self._is_local_path(dest_path):
