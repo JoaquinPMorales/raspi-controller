@@ -139,7 +139,8 @@ class RsyncCopier:
             return 0
 
     def _rsync_local(self, source: str, dest: str, console, progress, task_id, 
-                     display_name: str, progress_callback=None, source_is_dir: bool = True) -> bool:
+                     display_name: str, progress_callback=None, source_is_dir: bool = True,
+                     item_num: int = 1, total_items: int = 1) -> bool:
         """Run rsync locally using subprocess (much faster than SSH for local copies)."""
         source = source.rstrip('/')
         
@@ -167,7 +168,7 @@ class RsyncCopier:
             
             # Notify start
             if progress_callback:
-                progress_callback(0, "", "", "", 0, ep_total)
+                progress_callback(item_num, total_items, 0, "", "", "", 0, ep_total)
             
             # Read output line by line
             while True:
@@ -197,7 +198,8 @@ class RsyncCopier:
                     percent = progress_info['percent']
                     progress.update(task_id, completed=percent)
                     if progress_callback:
-                        progress_callback(percent, current_file, progress_info['speed'], progress_info['eta'], ep_num, ep_total)
+                        progress_callback(item_num, total_items, percent, current_file, 
+                                          progress_info['speed'], progress_info['eta'], ep_num, ep_total)
             
             # Wait for completion
             exit_status = process.wait()
@@ -214,12 +216,13 @@ class RsyncCopier:
             console.print(f"[red]Error during rsync: {e}[/red]")
             return False
     
-    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int, progress_callback=None) -> bool:
+    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int, 
+                           progress_callback=None, item_num: int = 1, total_items: int = 1) -> bool:
         """
         Copy a single item (TV season or movie) to Jellyfin with progress monitoring.
         
         Args:
-            progress_callback: Optional callback(percent, filename) for progress updates
+            progress_callback: Optional callback(item_num, total, percent, filename, speed, eta, ep_num, ep_total)
         
         Returns True on success, False on failure.
         """
@@ -251,7 +254,9 @@ class RsyncCopier:
                 console.print(f"[red]Failed to create destination directory: {e}[/red]")
                 return False
             # Use fast local rsync without SSH overhead
-            return self._rsync_local(source_path, dest_path, console, progress, task_id, display_name, progress_callback, source_is_dir=source_is_dir)
+            return self._rsync_local(source_path, dest_path, console, progress, task_id, 
+                                     display_name, progress_callback, source_is_dir=source_is_dir,
+                                     item_num=item_num, total_items=total_items)
         
         # Remote copy via SSH
         # Ensure destination directory exists
@@ -302,7 +307,7 @@ class RsyncCopier:
             
             # Notify start
             if progress_callback:
-                progress_callback(0, "", "", "")
+                progress_callback(item_num, total_items, 0, "", "", "", 0, 0)
             
             # Read output line by line for progress updates
             while not self.cancelled:
@@ -328,7 +333,7 @@ class RsyncCopier:
                     progress.update(task_id, completed=percent)
                     # Call back with speed and eta from rsync
                     if progress_callback:
-                        progress_callback(percent, current_file, speed, eta)
+                        progress_callback(item_num, total_items, percent, current_file, speed, eta, 0, 0)
             
             # Check exit status
             exit_status = stdout.channel.recv_exit_status()
@@ -427,15 +432,15 @@ class RsyncCopier:
                 # Track last progress percent to throttle callbacks
                 last_callback_percent = 0
                 
-                def _progress_wrapper(current_percent, filename="", speed="", eta="", ep_num=0, ep_total=0):
+                def _progress_wrapper(item_num, total, current_percent, filename, speed="", eta="", ep_num=0, ep_total=0):
                     nonlocal last_callback_percent
                     # Only call back on 10% increments or first/last
                     if progress_callback and (current_percent == 0 or current_percent >= 100 or 
                                                current_percent - last_callback_percent >= 10):
-                        progress_callback(i, len(items), current_percent, filename or display_name, speed, eta, ep_num, ep_total)
+                        progress_callback(item_num, total, current_percent, filename or display_name, speed, eta, ep_num, ep_total)
                         last_callback_percent = current_percent
                 
-                success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper)
+                success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper, item_num=i, total_items=len(items))
                 
                 if success:
                     progress.update(overall_task, advance=1)
@@ -786,7 +791,7 @@ class ExternalCopier:
                         # Only call back on 10% increments or first/last
                         if progress_callback and (current_percent == 0 or current_percent >= 100 or 
                                                    current_percent - last_callback_percent >= 10):
-                            progress_callback(i, total_items, current_percent, filename or display_name, speed, eta)
+                            progress_callback(i, total_items, current_percent, filename or display_name, speed, eta, 0, 0)
                             last_callback_percent = current_percent
                     
                     success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper)
