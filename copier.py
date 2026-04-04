@@ -67,6 +67,11 @@ class RsyncCopier:
             src = source.rstrip('/')
         dst = destination.rstrip('/') + '/'
         
+        # Sanity check: if source is supposed to be a dir but ends with a video
+        # extension, it's actually a file — correct source_is_dir automatically
+        if src.rstrip('/').lower().endswith(tuple(self._VIDEO_EXTENSIONS)):
+            src = src.rstrip('/')
+        
         return ['/usr/bin/rsync'] + flags + [src, dst]
     
     def _build_rsync_command(self, source: str, destination: str, source_is_dir: bool = True) -> str:
@@ -136,10 +141,10 @@ class RsyncCopier:
     def _rsync_local(self, source: str, dest: str, console, progress, task_id, 
                      display_name: str, progress_callback=None, source_is_dir: bool = True) -> bool:
         """Run rsync locally using subprocess (much faster than SSH for local copies)."""
-        source = source.rstrip()
+        source = source.rstrip('/')
         
         # Use arg list + shell=False to avoid PATH issues and shell quoting problems
-        args = self._build_rsync_args(source, dest.rstrip(), source_is_dir=source_is_dir)
+        args = self._build_rsync_args(source, dest.rstrip('/'), source_is_dir=source_is_dir)
         
         # Count episodes/files upfront — only meaningful for directories
         ep_total = self._count_video_files(source) if source_is_dir else 0
@@ -233,9 +238,9 @@ class RsyncCopier:
         else:
             display_name = show_name
         
-        # Strip any trailing whitespace from paths (folder names may have trailing spaces)
-        source_path = source_path.rstrip()
-        dest_path = dest_path.rstrip()
+        # Strip only trailing slashes — whitespace is valid in Linux filenames
+        source_path = source_path.rstrip('/')
+        dest_path = dest_path.rstrip('/')
         
         # If both paths are local, use subprocess directly (much faster than SSH)
         if self._is_local_path(source_path) and self._is_local_path(dest_path):

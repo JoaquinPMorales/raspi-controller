@@ -216,7 +216,7 @@ class FolderScanner:
             return items
         
         for entry in entries:
-            full_path = f"{path}/{entry.filename.rstrip()}"
+            full_path = f"{path}/{entry.filename}"
             is_dir = entry.st_mode & 0o40000 == 0o40000  # Check if directory
             
             # Parse show name and season, detect content type
