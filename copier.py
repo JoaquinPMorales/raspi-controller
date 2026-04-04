@@ -43,7 +43,7 @@ class RsyncCopier:
         """Signal cancellation of ongoing operations."""
         self.cancelled = True
     
-    def _build_rsync_args(self, source: str, destination: str) -> list:
+    def _build_rsync_args(self, source: str, destination: str, source_is_dir: bool = True) -> list:
         """Build rsync argument list (no shell quoting needed)."""
         dry_run = self.options_config.get('dry_run', False)
         bwlimit = self.options_config.get('bwlimit')
@@ -59,16 +59,20 @@ class RsyncCopier:
         if bwlimit:
             flags.append(f'--bwlimit={bwlimit}')
         
-        # Ensure source ends with / (copy contents, not folder itself)
-        src = source.rstrip('/') + '/'
+        if source_is_dir:
+            # Trailing / means "copy contents into dest", not the folder itself
+            src = source.rstrip('/') + '/'
+        else:
+            # For a single file, no trailing slash — copy the file into dest dir
+            src = source.rstrip('/')
         dst = destination.rstrip('/') + '/'
         
         return ['/usr/bin/rsync'] + flags + [src, dst]
     
-    def _build_rsync_command(self, source: str, destination: str) -> str:
+    def _build_rsync_command(self, source: str, destination: str, source_is_dir: bool = True) -> str:
         """Build rsync command string (used for SSH remote execution)."""
-        args = self._build_rsync_args(source, destination)
-        # Shell-quote paths (first and last elements)
+        args = self._build_rsync_args(source, destination, source_is_dir)
+        # Shell-quote paths (last two elements are source and dest)
         quoted = args[:-2] + [f"'{args[-2]}'", f"'{args[-1]}'"] 
         return ' '.join(quoted)
     
@@ -130,13 +134,15 @@ class RsyncCopier:
             return 0
 
     def _rsync_local(self, source: str, dest: str, console, progress, task_id, 
-                     display_name: str, progress_callback=None) -> bool:
+                     display_name: str, progress_callback=None, source_is_dir: bool = True) -> bool:
         """Run rsync locally using subprocess (much faster than SSH for local copies)."""
-        # Use arg list + shell=False to avoid PATH issues and shell quoting problems
-        args = self._build_rsync_args(source.rstrip(), dest.rstrip())
+        source = source.rstrip()
         
-        # Count episodes/files upfront so we can report X/Y progress
-        ep_total = self._count_video_files(source.rstrip())
+        # Use arg list + shell=False to avoid PATH issues and shell quoting problems
+        args = self._build_rsync_args(source, dest.rstrip(), source_is_dir=source_is_dir)
+        
+        # Count episodes/files upfront — only meaningful for directories
+        ep_total = self._count_video_files(source) if source_is_dir else 0
         ep_num = 0
         
         console.print(f"[dim]Executing locally: {' '.join(args)}[/dim]")
@@ -216,6 +222,7 @@ class RsyncCopier:
         show_name = item['show']
         season = item.get('season')
         content_type = item.get('content_type', 'movie')
+        source_is_dir = item.get('type', 'folder') == 'folder'
         
         # Build destination path based on content type
         dest_path = self._get_destination_path(item)
@@ -239,7 +246,7 @@ class RsyncCopier:
                 console.print(f"[red]Failed to create destination directory: {e}[/red]")
                 return False
             # Use fast local rsync without SSH overhead
-            return self._rsync_local(source_path, dest_path, console, progress, task_id, display_name, progress_callback)
+            return self._rsync_local(source_path, dest_path, console, progress, task_id, display_name, progress_callback, source_is_dir=source_is_dir)
         
         # Remote copy via SSH
         # Ensure destination directory exists
@@ -280,10 +287,7 @@ class RsyncCopier:
             
             # Build and execute rsync command
             # Note: no get_pty so stderr is kept separate for error capture
-            rsync_cmd = self._build_rsync_command(
-                f"'{source_path}/'",
-                f"'{dest_path}/'"
-            )
+            rsync_cmd = self._build_rsync_command(source_path, dest_path, source_is_dir=source_is_dir)
             
             console.print(f"[dim]Executing: {rsync_cmd}[/dim]")
             
