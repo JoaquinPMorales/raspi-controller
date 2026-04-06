@@ -2017,13 +2017,14 @@ def main():
             CommandHandler('idea', idea_command),
             CommandHandler('ideas', ideas_command),
             CommandHandler('finish', finish_command),
-            CommandHandler('reboot', reboot_command),
-            CallbackQueryHandler(reboot_callback, pattern='^reboot_'),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
         ],
     )
     
     application.add_handler(conv_handler)
+    
+    # Add reboot callback handler outside conversation (must be before other handlers)
+    application.add_handler(CallbackQueryHandler(reboot_callback, pattern='^reboot_'))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('status', status_command))
     application.add_handler(CommandHandler('health', health_command))
