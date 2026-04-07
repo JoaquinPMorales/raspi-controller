@@ -1586,7 +1586,7 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     if fix_mode:
         search_term = ' '.join(args[1:]) if len(args) > 1 else None
-        await update.message.reply_text("🔧 Analyzing TV shows for reorganization...")
+        progress_msg = await update.message.reply_text("🔧 Analyzing TV shows for reorganization...")
     else:
         search_term = ' '.join(args) if args else None
         await update.message.reply_text("🔍 Scanning TV Shows folder...")
@@ -1679,13 +1679,23 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(text, parse_mode='Markdown')
         return
     
-    # FIX MODE: Actually reorganize folders
+    # FIX MODE: Actually reorganize folders with progress updates
     moves_made = []
     errors = []
+    total_shows = len([r for r in results if len(r[1]) > 1])
+    processed = 0
+    
+    async def update_progress(status_text):
+        try:
+            await progress_msg.edit_text(f"🔧 Reorganizing... ({processed}/{total_shows})\n{status_text}")
+        except Exception:
+            pass  # Ignore edit errors
     
     for norm, folders in results:
         if len(folders) < 2:
             continue  # Nothing to fix
+        
+        processed += 1
         
         # Find the best target folder (prefer one with year in name, e.g. "Show (2020)")
         target = None
@@ -1696,15 +1706,15 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         
         if not target:
             # No clean folder exists — derive a clean name from the first folder
-            # Strip season numbers, tags, brackets to get base title
             base_name = re.sub(r'[\[\(][^\]\)]*[\]\)]', '', sorted(folders)[0])
             base_name = re.sub(r'\s*[Ss]\d{1,2}([Ee]\d{1,2})?\b.*', '', base_name)
             base_name = re.sub(r'\s*(WEBDL|WEB-DL|BluRay|HDTV|HDO|PACK|1080p|720p|x264|x265|AVC|HEVC)\b.*', '', base_name, flags=re.IGNORECASE)
             base_name = re.sub(r'[\s\-_]+$', '', base_name.strip())
             target = base_name if base_name else sorted(folders)[0]
         
+        await update_progress(f"Processing: *{target}* — {len(folders)} folders")
+        
         target_path = os.path.join(shows_path, target)
-        # Create target folder if it doesn't already exist as one of the season folders
         os.makedirs(target_path, exist_ok=True)
         
         for folder in folders:
@@ -1758,14 +1768,32 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             except Exception as e:
                 errors.append(f"Error processing {folder}: {e}")
     
-    # Build result report
-    if moves_made:
+    # Build detailed result report
+    actual_moves = [m for m in moves_made if '→' in m]
+    removed = [m for m in moves_made if '🗑' in m]
+    skipped = [m for m in moves_made if '⏭️' in m or '⚠️' in m]
+    
+    if actual_moves or removed:
         lines = ["✅ *Reorganization Complete*\n"]
-        lines.append(f"Moves made: {len([m for m in moves_made if '→' in m])}\n")
-        for move in moves_made[:20]:  # Limit output
-            lines.append(f"• {move}")
-        if len(moves_made) > 20:
-            lines.append(f"\n... and {len(moves_made) - 20} more")
+        lines.append(f"📺 Shows processed: {processed}")
+        lines.append(f"📁 Seasons moved: {len(actual_moves)}")
+        lines.append(f"🗑 Empty folders removed: {len(removed)}")
+        if skipped:
+            lines.append(f"⏭️ Skipped: {len(skipped)}\n")
+        else:
+            lines.append("")
+        
+        if actual_moves:
+            lines.append("*Moves:*")
+            for move in actual_moves[:15]:
+                lines.append(f"• {move}")
+            if len(actual_moves) > 15:
+                lines.append(f"... and {len(actual_moves) - 15} more")
+        
+        if removed and len(actual_moves) <= 10:
+            lines.append("\n*Cleanup:*")
+            for r in removed[:5]:
+                lines.append(f"• {r}")
     else:
         lines = ["ℹ️ *No reorganization needed*\n"]
         lines.append("All seasons are already properly grouped.")
@@ -1775,11 +1803,11 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         for err in errors[:5]:
             lines.append(f"• {err}")
         if len(errors) > 5:
-            lines.append(f"... and {len(errors) - 5} more errors")
+            lines.append(f"... and {len(errors) - 5} more")
     
     # Refresh Jellyfin after reorganization
     lines.append("\n🔄 Refreshing Jellyfin library...")
-    await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+    await progress_msg.edit_text('\n'.join(lines), parse_mode='Markdown')
     
     try:
         from jellyfin import refresh_jellyfin_library
