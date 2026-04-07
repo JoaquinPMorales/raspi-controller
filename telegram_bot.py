@@ -1602,10 +1602,18 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ Shows folder not found: {shows_path}")
         return
     
-    # Normalize show name for grouping
+    # Normalize show name for grouping — extract base title only
     def normalize(name):
-        # Remove year suffix, spaces, special chars
-        name = re.sub(r'\s*\(\d{4}\)\s*$', '', name)
+        # Remove anything in brackets/parentheses: [WEBDL...], (2025), [PACK]...
+        name = re.sub(r'[\[\(][^\]\)]*[\]\)]', '', name)
+        # Remove season markers: S01, Season 1, S01E01
+        name = re.sub(r'\s*[Ss]\d{1,2}([Ee]\d{1,2})?\b.*', '', name)
+        name = re.sub(r'\s*[Ss]eason\s*\d{1,2}\b.*', '', name, flags=re.IGNORECASE)
+        # Remove common release tags that may appear without brackets
+        name = re.sub(r'\s*(WEBDL|WEB-DL|BluRay|HDTV|HDO|PACK|1080p|720p|x264|x265|AVC|HEVC|AAC|AC3|DD\+?|EAC3)\b.*', '', name, flags=re.IGNORECASE)
+        # Strip leftover separators and whitespace
+        name = re.sub(r'[\s\-_\.]+$', '', name.strip())
+        # Return lowercase alphanumeric only for comparison
         return re.sub(r'[^a-z0-9]', '', name.lower())
     
     # Group folders by normalized show name
@@ -1646,9 +1654,19 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             lines.append(f"Search: `{search_term}`\n")
         
         for norm, folders in sorted(results, key=lambda x: x[0]):
-            lines.append(f"\n*{folders[0].split('(')[0].strip()}*")
+            # Derive the clean target name for display
+            clean = None
+            for f in sorted(folders):
+                if re.search(r'\(\d{4}\)', f):
+                    clean = f
+                    break
+            if not clean:
+                clean = re.sub(r'[\[\(][^\]\)]*[\]\)]', '', sorted(folders)[0])
+                clean = re.sub(r'\s*[Ss]\d{1,2}([Ee]\d{1,2})?\b.*', '', clean)
+                clean = re.sub(r'[\s\-_]+$', '', clean.strip())
+            lines.append(f"\n*{clean}*")
             if len(folders) > 1:
-                lines.append(f"⚠️ {len(folders)} separate folders:")
+                lines.append(f"⚠️ {len(folders)} separate folders → will merge into `{clean}/`:")
             for f in sorted(folders):
                 lines.append(f"  📁 `{f}`")
         
@@ -1669,16 +1687,25 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if len(folders) < 2:
             continue  # Nothing to fix
         
-        # Find the best target folder (prefer one with year in name)
+        # Find the best target folder (prefer one with year in name, e.g. "Show (2020)")
         target = None
         for f in sorted(folders):
             if re.search(r'\(\d{4}\)', f):
                 target = f
                 break
+        
         if not target:
-            target = sorted(folders)[0]  # Alphabetical first
+            # No clean folder exists — derive a clean name from the first folder
+            # Strip season numbers, tags, brackets to get base title
+            base_name = re.sub(r'[\[\(][^\]\)]*[\]\)]', '', sorted(folders)[0])
+            base_name = re.sub(r'\s*[Ss]\d{1,2}([Ee]\d{1,2})?\b.*', '', base_name)
+            base_name = re.sub(r'\s*(WEBDL|WEB-DL|BluRay|HDTV|HDO|PACK|1080p|720p|x264|x265|AVC|HEVC)\b.*', '', base_name, flags=re.IGNORECASE)
+            base_name = re.sub(r'[\s\-_]+$', '', base_name.strip())
+            target = base_name if base_name else sorted(folders)[0]
         
         target_path = os.path.join(shows_path, target)
+        # Create target folder if it doesn't already exist as one of the season folders
+        os.makedirs(target_path, exist_ok=True)
         
         for folder in folders:
             if folder == target:
@@ -1686,40 +1713,50 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             
             source_path = os.path.join(shows_path, folder)
             
-            # Check if source contains Season XX subfolders
             try:
-                for entry in os.scandir(source_path):
-                    if entry.is_dir() and re.match(r'[Ss]eason\s*\d+', entry.name, re.IGNORECASE):
-                        # Move season folder to target
+                # Extract season number from the folder name itself (e.g. "Modern Family S02 [...]")
+                season_match = re.search(r'[Ss](\d{1,2})\b', folder)
+                season_subfolders = [e for e in os.scandir(source_path)
+                                     if e.is_dir() and re.match(r'[Ss]eason\s*\d+', e.name, re.IGNORECASE)]
+                
+                if season_subfolders:
+                    # Case A: source contains Season XX subfolders — move each one
+                    for entry in season_subfolders:
                         dest_season_path = os.path.join(target_path, entry.name)
-                        
-                        # Handle conflicts: rename if season already exists
                         if os.path.exists(dest_season_path):
                             counter = 1
                             while os.path.exists(f"{dest_season_path}_old{counter}"):
                                 counter += 1
                             dest_season_path = f"{dest_season_path}_old{counter}"
-                        
                         shutil.move(entry.path, dest_season_path)
                         moves_made.append(f"{folder}/{entry.name} → {target}/")
-                        
-                # Check if source is now empty or only has non-video files
-                remaining = list(os.scandir(source_path))
-                if not remaining or all(not e.name.endswith(('.mkv', '.mp4', '.avi')) for e in remaining):
-                    # Safe to remove or mark for cleanup
-                    try:
-                        if not remaining:
-                            os.rmdir(source_path)
-                            moves_made.append(f"🗑 Removed empty folder: {folder}")
-                        else:
-                            moves_made.append(f"⚠️ Left non-video files in: {folder}")
-                    except Exception as e:
-                        errors.append(f"Could not remove {folder}: {e}")
+                elif season_match:
+                    # Case B: source IS a season folder (flat episodes inside)
+                    # Move the whole folder as Season XX inside target
+                    season_num = season_match.group(1).zfill(2)
+                    dest_season_path = os.path.join(target_path, f"Season {season_num}")
+                    if os.path.exists(dest_season_path):
+                        counter = 1
+                        while os.path.exists(f"{dest_season_path}_old{counter}"):
+                            counter += 1
+                        dest_season_path = f"{dest_season_path}_old{counter}"
+                    shutil.move(source_path, dest_season_path)
+                    moves_made.append(f"{folder} → {target}/Season {season_num}/")
+                    continue  # source_path is gone, skip cleanup
                 else:
-                    moves_made.append(f"⏭️ Skipped {folder} (still has video files)")
+                    moves_made.append(f"⏭️ Skipped {folder} (no season info found)")
+                    continue
+                
+                # Check if source is now empty
+                remaining = list(os.scandir(source_path))
+                if not remaining:
+                    os.rmdir(source_path)
+                    moves_made.append(f"🗑 Removed empty folder: {folder}")
+                else:
+                    moves_made.append(f"⚠️ Left non-empty folder: {folder}")
                     
             except Exception as e:
-                errors.append(f"Error moving from {folder}: {e}")
+                errors.append(f"Error processing {folder}: {e}")
     
     # Build result report
     if moves_made:
