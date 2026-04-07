@@ -479,9 +479,16 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         lines = [f"📋 *{num_done}/{total_items} items done* — {elapsed}s elapsed"]
         lines.append("")
         
-        # Show completed items
-        for name in completed:
-            lines.append(f"✅ {name}")
+        # Show completed items (limit to last 10 to keep message short)
+        if completed:
+            if len(completed) > 10:
+                lines.append(f"✅ ... ({len(completed) - 10} more)")
+                for name in completed[-10:]:
+                    lines.append(f"✅ {name}")
+            else:
+                for name in completed:
+                    lines.append(f"✅ {name}")
+            lines.append("")
         
         # Show current item in progress
         if i > 0:
@@ -497,14 +504,20 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
             if eta and eta not in ('0:00:00', ''):
                 lines.append(f"⏱ ETA `{eta}`")
         
+        text = '\n'.join(lines)
+        
+        # Truncate if too long (Telegram limit is 4096)
+        if len(text) > 4000:
+            text = text[:3997] + '...'
+        
         try:
             await query.message.edit_text(
-                '\n'.join(lines),
+                text,
                 parse_mode='Markdown'
             )
-        except Exception:
-            # Ignore edit conflicts (message not modified)
-            pass
+        except Exception as e:
+            # Log the actual error for debugging
+            logger.warning(f"Failed to edit message: {e}")
     
     def progress_callback(item_num, total, percent, filename, speed="", eta="", ep_num=0, ep_total=0):
         """Called by copier from executor thread — schedule coroutine on the event loop."""
