@@ -1572,7 +1572,7 @@ async def finish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Search and group TV shows in the media folder."""
+    """Search and group/fix TV shows in the media folder."""
     config = context.bot_data.get('config')
     allowed_users = config.get('telegram', {}).get('allowed_users', [])
     user_id = update.effective_user.id
@@ -1581,12 +1581,19 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("⛔ Unauthorized.")
         return
     
-    search_term = ' '.join(context.args) if context.args else None
+    args = context.args or []
+    fix_mode = args and args[0].lower() == 'fix'
     
-    await update.message.reply_text("🔍 Scanning TV Shows folder...")
+    if fix_mode:
+        search_term = ' '.join(args[1:]) if len(args) > 1 else None
+        await update.message.reply_text("🔧 Analyzing TV shows for reorganization...")
+    else:
+        search_term = ' '.join(args) if args else None
+        await update.message.reply_text("🔍 Scanning TV Shows folder...")
     
     import os
     import re
+    import shutil
     from collections import defaultdict
     
     shows_path = config['paths'].get('jellyfin_shows') or config['paths'].get('jellyfin_tv')
@@ -1632,25 +1639,126 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.message.reply_text("✅ No duplicate series folders found. All shows are properly grouped!")
         return
     
-    # Build report
-    lines = ["📺 *TV Show Grouping Report*\n"]
-    if search_term:
-        lines.append(f"Search: `{search_term}`\n")
+    if not fix_mode:
+        # Build report only
+        lines = ["📺 *TV Show Grouping Report*\n"]
+        if search_term:
+            lines.append(f"Search: `{search_term}`\n")
+        
+        for norm, folders in sorted(results, key=lambda x: x[0]):
+            lines.append(f"\n*{folders[0].split('(')[0].strip()}*")
+            if len(folders) > 1:
+                lines.append(f"⚠️ {len(folders)} separate folders:")
+            for f in sorted(folders):
+                lines.append(f"  📁 `{f}`")
+        
+        lines.append("\n\n💡 Use `/group fix [Show Name]` to reorganize automatically.")
+        
+        text = '\n'.join(lines)
+        if len(text) > 4000:
+            text = text[:3997] + '...'
+        
+        await update.message.reply_text(text, parse_mode='Markdown')
+        return
     
-    for norm, folders in sorted(results, key=lambda x: x[0]):
-        lines.append(f"\n*{folders[0].split('(')[0].strip()}*")
-        if len(folders) > 1:
-            lines.append(f"⚠️ {len(folders)} separate folders:")
+    # FIX MODE: Actually reorganize folders
+    moves_made = []
+    errors = []
+    
+    for norm, folders in results:
+        if len(folders) < 2:
+            continue  # Nothing to fix
+        
+        # Find the best target folder (prefer one with year in name)
+        target = None
         for f in sorted(folders):
-            lines.append(f"  📁 `{f}`")
+            if re.search(r'\(\d{4}\)', f):
+                target = f
+                break
+        if not target:
+            target = sorted(folders)[0]  # Alphabetical first
+        
+        target_path = os.path.join(shows_path, target)
+        
+        for folder in folders:
+            if folder == target:
+                continue  # Skip the target folder itself
+            
+            source_path = os.path.join(shows_path, folder)
+            
+            # Check if source contains Season XX subfolders
+            try:
+                for entry in os.scandir(source_path):
+                    if entry.is_dir() and re.match(r'[Ss]eason\s*\d+', entry.name, re.IGNORECASE):
+                        # Move season folder to target
+                        dest_season_path = os.path.join(target_path, entry.name)
+                        
+                        # Handle conflicts: rename if season already exists
+                        if os.path.exists(dest_season_path):
+                            counter = 1
+                            while os.path.exists(f"{dest_season_path}_old{counter}"):
+                                counter += 1
+                            dest_season_path = f"{dest_season_path}_old{counter}"
+                        
+                        shutil.move(entry.path, dest_season_path)
+                        moves_made.append(f"{folder}/{entry.name} → {target}/")
+                        
+                # Check if source is now empty or only has non-video files
+                remaining = list(os.scandir(source_path))
+                if not remaining or all(not e.name.endswith(('.mkv', '.mp4', '.avi')) for e in remaining):
+                    # Safe to remove or mark for cleanup
+                    try:
+                        if not remaining:
+                            os.rmdir(source_path)
+                            moves_made.append(f"🗑 Removed empty folder: {folder}")
+                        else:
+                            moves_made.append(f"⚠️ Left non-video files in: {folder}")
+                    except Exception as e:
+                        errors.append(f"Could not remove {folder}: {e}")
+                else:
+                    moves_made.append(f"⏭️ Skipped {folder} (still has video files)")
+                    
+            except Exception as e:
+                errors.append(f"Error moving from {folder}: {e}")
     
-    lines.append("\n\n💡 To fix: Move seasons into a single 'Series Name (Year)' folder.")
+    # Build result report
+    if moves_made:
+        lines = ["✅ *Reorganization Complete*\n"]
+        lines.append(f"Moves made: {len([m for m in moves_made if '→' in m])}\n")
+        for move in moves_made[:20]:  # Limit output
+            lines.append(f"• {move}")
+        if len(moves_made) > 20:
+            lines.append(f"\n... and {len(moves_made) - 20} more")
+    else:
+        lines = ["ℹ️ *No reorganization needed*\n"]
+        lines.append("All seasons are already properly grouped.")
     
-    text = '\n'.join(lines)
-    if len(text) > 4000:
-        text = text[:3997] + '...'
+    if errors:
+        lines.append(f"\n⚠️ *Errors ({len(errors)}):*")
+        for err in errors[:5]:
+            lines.append(f"• {err}")
+        if len(errors) > 5:
+            lines.append(f"... and {len(errors) - 5} more errors")
     
-    await update.message.reply_text(text, parse_mode='Markdown')
+    # Refresh Jellyfin after reorganization
+    lines.append("\n🔄 Refreshing Jellyfin library...")
+    await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+    
+    try:
+        from jellyfin import refresh_jellyfin_library
+        jellyfin_config = config.get('jellyfin', {})
+        refresh_success = refresh_jellyfin_library(
+            host=jellyfin_config.get('host', config['pi']['host']),
+            port=jellyfin_config.get('port', 8096),
+            api_key=jellyfin_config.get('api_key')
+        )
+        if refresh_success:
+            await update.message.reply_text("✅ Jellyfin refreshed successfully!")
+        else:
+            await update.message.reply_text("⚠️ Jellyfin refresh failed. You may need to refresh manually.")
+    except Exception as e:
+        logger.warning(f"Jellyfin refresh failed: {e}")
+        await update.message.reply_text("⚠️ Could not refresh Jellyfin automatically.")
 
 
 async def temp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2024,6 +2132,7 @@ def main():
             BotCommand('idea', 'Save a new idea'),
             BotCommand('ideas', 'List all ideas by day'),
             BotCommand('finish', 'Mark idea as finished'),
+            BotCommand('group', 'Check or fix TV show grouping'),
             BotCommand('reboot', 'Reboot the Pi'),
             BotCommand('cancel', 'Cancel current operation'),
         ])
