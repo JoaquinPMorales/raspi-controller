@@ -815,6 +815,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/idea - Save a new idea (e.g. /idea Buy more storage)\n"
         "/ideas - List all ideas by day\n"
         "/finish - Mark idea as done (e.g. /finish 3)\n"
+        "/group - Check TV show grouping in media folder (e.g. /group Modern Family)\n"
         "/reboot - Reboot the Pi\n"
         "/cancel - Cancel current operation\n\n"
         "How to use:\n"
@@ -1570,6 +1571,88 @@ async def finish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(f"❌ Idea #{idea_id} not found.")
 
 
+async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search and group TV shows in the media folder."""
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id, allowed_users):
+        await update.message.reply_text("⛔ Unauthorized.")
+        return
+    
+    search_term = ' '.join(context.args) if context.args else None
+    
+    await update.message.reply_text("🔍 Scanning TV Shows folder...")
+    
+    import os
+    import re
+    from collections import defaultdict
+    
+    shows_path = config['paths'].get('jellyfin_shows') or config['paths'].get('jellyfin_tv')
+    
+    if not shows_path or not os.path.isdir(shows_path):
+        await update.message.reply_text(f"❌ Shows folder not found: {shows_path}")
+        return
+    
+    # Normalize show name for grouping
+    def normalize(name):
+        # Remove year suffix, spaces, special chars
+        name = re.sub(r'\s*\(\d{4}\)\s*$', '', name)
+        return re.sub(r'[^a-z0-9]', '', name.lower())
+    
+    # Group folders by normalized show name
+    groups = defaultdict(list)
+    try:
+        for entry in os.scandir(shows_path):
+            if entry.is_dir():
+                norm = normalize(entry.name)
+                if norm:
+                    groups[norm].append(entry.name)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error scanning: {str(e)}")
+        return
+    
+    # Filter to groups with multiple folders (potential issues) or matching search
+    results = []
+    for norm, folders in groups.items():
+        if search_term:
+            # Include if search matches any folder name
+            if any(search_term.lower() in f.lower() for f in folders):
+                results.append((norm, folders))
+        else:
+            # Include if multiple folders for same show (grouping needed)
+            if len(folders) > 1:
+                results.append((norm, folders))
+    
+    if not results:
+        if search_term:
+            await update.message.reply_text(f"🔍 No shows matching '{search_term}' found.")
+        else:
+            await update.message.reply_text("✅ No duplicate series folders found. All shows are properly grouped!")
+        return
+    
+    # Build report
+    lines = ["📺 *TV Show Grouping Report*\n"]
+    if search_term:
+        lines.append(f"Search: `{search_term}`\n")
+    
+    for norm, folders in sorted(results, key=lambda x: x[0]):
+        lines.append(f"\n*{folders[0].split('(')[0].strip()}*")
+        if len(folders) > 1:
+            lines.append(f"⚠️ {len(folders)} separate folders:")
+        for f in sorted(folders):
+            lines.append(f"  📁 `{f}`")
+    
+    lines.append("\n\n💡 To fix: Move seasons into a single 'Series Name (Year)' folder.")
+    
+    text = '\n'.join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + '...'
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
 async def temp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show CPU temperature."""
     config = context.bot_data.get('config')
@@ -2030,6 +2113,7 @@ def main():
             CommandHandler('idea', idea_command),
             CommandHandler('ideas', ideas_command),
             CommandHandler('finish', finish_command),
+            CommandHandler('group', group_command),
             CallbackQueryHandler(cancel, pattern='^cancel$'),
         ],
     )
@@ -2057,6 +2141,7 @@ def main():
     application.add_handler(CommandHandler('idea', idea_command))
     application.add_handler(CommandHandler('ideas', ideas_command))
     application.add_handler(CommandHandler('finish', finish_command))
+    application.add_handler(CommandHandler('group', group_command))
     application.add_handler(CommandHandler('reboot', reboot_command))
     
     # Run the bot

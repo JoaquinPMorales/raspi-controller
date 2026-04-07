@@ -101,6 +101,33 @@ class RsyncCopier:
         
         return None
     
+    def _find_existing_series_folder(self, dest_base: str, show_name: str) -> Optional[str]:
+        """
+        Check if a series folder already exists in the destination.
+        Returns the existing folder name if found, None otherwise.
+        Matches case-insensitively and handles both 'Name (year)' and 'Name' formats.
+        """
+        # Normalize show name for comparison (lowercase, no special chars)
+        def normalize(name):
+            return re.sub(r'[^a-z0-9]', '', name.lower())
+        
+        target_normalized = normalize(show_name)
+        
+        # Check if destination exists locally
+        if os.path.isdir(dest_base):
+            try:
+                for entry in os.scandir(dest_base):
+                    if entry.is_dir():
+                        entry_name = entry.name
+                        # Remove year suffix for comparison: "Name (2020)" -> "Name"
+                        name_without_year = re.sub(r'\s*\(\d{4}\)\s*$', '', entry_name)
+                        if normalize(name_without_year) == target_normalized:
+                            return entry_name  # Return exact existing folder name
+            except Exception:
+                pass
+        
+        return None
+    
     def _get_destination_path(self, item: Dict) -> str:
         """Determine the correct destination path based on content type."""
         content_type = item.get('content_type', 'movie')
@@ -110,8 +137,13 @@ class RsyncCopier:
         
         if content_type == 'tv':
             dest_base = self.paths_config.get('jellyfin_shows') or self.paths_config.get('jellyfin_tv')
-            # Jellyfin: Series Name (year)/Season 01
-            folder_name = f"{show_name} ({year})" if year else show_name
+            # Check for existing series folder first
+            existing_folder = self._find_existing_series_folder(dest_base, show_name)
+            if existing_folder:
+                folder_name = existing_folder
+            else:
+                # Jellyfin: Series Name (year)/Season 01
+                folder_name = f"{show_name} ({year})" if year else show_name
             if season:
                 return f"{dest_base}/{folder_name}/Season {season}"
             else:
