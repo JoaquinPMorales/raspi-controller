@@ -424,7 +424,13 @@ The bot can create full SD card backups and upload them to Google Drive using rc
    ```yaml
    backup:
      enabled: true
-     source_device: "/dev/mmcblk0"  # Your SD card device
+     mode: "full"                # "full", "rsync", or "restic"
+     # full mode (dd image)
+     source_device: "/dev/mmcblk0"  # Your SD card device (full mode)
+     # rsync/restic mode (files/directories)
+     source_path: "/mnt/storage/data" # Path to snapshot (rsync/restic)
+     # restic options (if mode == "restic")
+     restic_repo: "/mnt/storage/restic_repo" # restic repo path or remote
      local_path: "/mnt/storage/backups"
      cloud_enabled: true
      cloud_remote: "gdrive:Backups"
@@ -502,6 +508,102 @@ sudo apt install rclone
 - Verify `rclone listremotes` shows `gdrive:`
 - Check `config.yaml` has `cloud_remote: "gdrive:Backups"`
 - Make sure the `:` is included in the remote name
+
+#### Advanced Backup Modes & Retention
+
+This project supports three backup modes (set `backup.mode` in config.yaml): `full` (raw SD image), `rsync` (snapshot + archive), and `restic` (incremental, file-level). The right choice depends on whether you need full disk images or efficient incremental file backups.
+
+Restic (recommended for incremental backups)
+
+- Install restic:
+```bash
+sudo apt update && sudo apt install restic
+```
+
+- Initialize a repository (local):
+```bash
+export RESTIC_PASSWORD='your-strong-password'
+restic -r /mnt/storage/restic_repo init
+```
+Or use a remote backend (SFTP):
+```bash
+restic -r sftp:user@host:/path/to/repo init
+```
+
+- Run a backup:
+```bash
+restic -r /mnt/storage/restic_repo backup /path/to/source
+```
+
+- Apply a retention policy (example):
+```bash
+restic forget --prune --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-yearly 1
+```
+
+- Test a restore:
+```bash
+restic -r /mnt/storage/restic_repo restore latest --target /tmp/restore
+```
+
+- Running from systemd: store `RESTIC_PASSWORD` and any env vars in `/etc/raspi-backup.env` and reference via `EnvironmentFile=` in your service unit.
+
+Rsync snapshots (link-dest)
+
+- Create space-efficient snapshots using hardlinks:
+```bash
+SNAPROOT=/mnt/storage/backups/snapshots
+mkdir -p "$SNAPROOT"
+rsync -a --delete --link-dest="$SNAPROOT/previous" /source/path/ "$SNAPROOT/snapshot-$(date +%Y%m%d_%H%M%S)"
+```
+
+- Archive a snapshot for upload (optional):
+```bash
+tar -C "$SNAPROOT" -czf /mnt/storage/backups/raspi-backup-$(date +%Y%m%d).tar.gz snapshot-YYYY...
+```
+
+- Retention example (keep last 7 snapshots):
+```bash
+cd "$SNAPROOT"
+ls -1tr | head -n -7 | xargs -r -d '\n' rm -rf --
+```
+Adjust the rotation command for your shell/platform.
+
+Full image (dd)
+
+- Full SD card image (legacy, slower but exact): already available via `dd` + `gzip`.
+- Restore example:
+```bash
+gunzip -c /path/to/raspi-backup.img.gz | sudo dd of=/dev/mmcblk0 bs=4M status=progress
+```
+
+Using rclone with restic or snapshots
+
+- You can sync restic repositories or snapshot archives with rclone:
+```bash
+rclone sync /mnt/storage/restic_repo gdrive:Backups/restic_repo
+# or
+rclone copy /mnt/storage/backups gdrive:Backups --transfers 1
+```
+Note: syncing restic repositories remotely can be advanced; consult restic docs before operating on remote repos.
+
+Automation (systemd/timer or cron)
+
+- Create a small wrapper script that activates your virtualenv and invokes the backup workflow (recommended). Example cron entry to run monthly at 03:00 on day 1:
+```cron
+0 3 1 * * /home/pi/raspi-controller/scripts/run-backup.sh >> /var/log/raspi-backup.log 2>&1
+```
+- Prefer systemd timers for better control and logging. Place secrets (RESTIC_PASSWORD) in an EnvironmentFile such as `/etc/raspi-backup.env` and secure its permissions.
+
+Migration notes & testing
+
+- If moving from `full` images to `restic`, keep at least one full image until you validate file-level restores.
+- Always perform a test restore to a disposable device or temporary directory before trusting automated backups.
+- Validate status with `/backupstatus` and by inspecting the `.backup_status.json` file in your configured `local_path`.
+
+Useful links
+
+- Restic documentation: https://restic.readthedocs.io/
+- rsync manual: https://linux.die.net/man/1/rsync
 
 ### Running the Bot as a Service (Auto-start on boot)
 

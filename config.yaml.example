@@ -57,13 +57,23 @@ tmdb:
   # Without it, shows work fine but parent folder won't have year: "Breaking Bad/Season 01"
 
 # Backup Configuration (optional)
-# Creates monthly system backups of the SD card
+# Creates monthly system backups of the SD card or snapshots of data
 backup:
   enabled: false                  # Set to true to enable backups
-  source_device: "/dev/mmcblk0"  # SD card device to backup
+  mode: "full"                   # "full", "rsync", or "restic"
+  # full mode: raw SD card image (dd + gzip)
+  source_device: "/dev/mmcblk0"  # SD card device to backup (used by full mode)
+  # rsync/restic modes: snapshot files or directories
+  source_path: "/path/to/data"   # Path to snapshot (rsync/restic)
+  # restic options (when mode == "restic")
+  restic_repo: "/mnt/storage/restic_repo"  # restic repo path or remote
+  # Local storage and cloud upload
   local_path: "/mnt/storage/backups"  # Where to store backups locally
   cloud_enabled: false            # Upload to cloud storage via rclone
   cloud_remote: "gdrive:Backups" # rclone remote path (e.g., gdrive:Backups)
   auto_backup: true               # Run backup automatically when due (30 days)
+  # Notes:
+  # - For restic, set RESTIC_PASSWORD env var or configure in systemd EnvironmentFile
+  # - For rsync mode, source_path is required; snapshots use hardlink snapshots via --link-dest
   # To set up Google Drive: https://rclone.org/drive/
 

@@ -79,20 +79,35 @@ class SystemBackup:
         """
         Create a new system backup.
         Returns (success, message)
+
+        Supports multiple modes configured via backup.mode: 'full' (dd image),
+        'rsync' (snapshot via rsync + tar archive), 'restic'. Default is 'full'.
         """
         os.makedirs(self.local_path, exist_ok=True)
-        
+        mode = self.backup_config.get('mode', 'full')
+
+        if progress_callback:
+            progress_callback(f"Selected backup mode: {mode}")
+
+        if mode == 'full':
+            return self._create_full_image(progress_callback)
+        elif mode == 'rsync':
+            return self._create_rsync_snapshot(progress_callback)
+        elif mode == 'restic':
+            return self._create_restic_snapshot(progress_callback)
+        else:
+            return False, f"Unknown backup mode: {mode}"
+
+    def _create_full_image(self, progress_callback=None) -> tuple[bool, str]:
+        """Create a full dd+gzip image (legacy behaviour)."""
         backup_file = os.path.join(self.local_path, self.get_backup_filename())
         old_backup = self.get_latest_backup()
-        
+
         try:
-            # Create backup using dd + gzip
-            # Use pv if available for progress, otherwise dd status=progress
             cmd = f"sudo dd if={self.source_device} bs=4M status=progress | gzip > {backup_file}"
-            
             if progress_callback:
-                progress_callback("Starting backup creation...")
-            
+                progress_callback("Starting full-image backup (dd + gzip)...")
+
             logger.info(f"Creating backup: {backup_file}")
             result = subprocess.run(
                 cmd,
@@ -101,43 +116,36 @@ class SystemBackup:
                 text=True,
                 timeout=7200  # 2 hour timeout
             )
-            
+
             if result.returncode != 0:
-                # Clean up failed backup
                 if os.path.exists(backup_file):
                     os.remove(backup_file)
                 return False, f"Backup failed: {result.stderr}"
-            
-            # Get backup size
+
             size = os.path.getsize(backup_file)
             size_mb = size / (1024 * 1024)
-            
+
             if progress_callback:
                 progress_callback(f"Backup created: {size_mb:.1f} MB")
-            
-            # Upload to cloud if enabled
+
             if self.cloud_enabled:
                 if progress_callback:
                     progress_callback("Uploading to cloud storage...")
-                
+
                 cloud_success, cloud_msg = self.upload_to_cloud(backup_file, progress_callback)
                 if not cloud_success:
-                    # Don't fail the backup if cloud upload fails, just warn
                     logger.warning(f"Cloud upload failed: {cloud_msg}")
-            
-            # Remove old backup after successful new backup
+
             if old_backup and old_backup != backup_file:
                 if progress_callback:
                     progress_callback("Removing old backup...")
                 try:
                     os.remove(old_backup)
-                    # Also remove from cloud if enabled
                     if self.cloud_enabled:
                         self.remove_from_cloud(os.path.basename(old_backup))
                 except Exception as e:
                     logger.warning(f"Failed to remove old backup: {e}")
-            
-            # Update status
+
             status = self.load_status()
             status['last_backup'] = datetime.now().isoformat()
             status['last_success'] = datetime.now().isoformat()
@@ -145,9 +153,9 @@ class SystemBackup:
             status['latest_size'] = size
             status['cloud_sync'] = self.cloud_enabled
             self.save_status(status)
-            
+
             return True, f"Backup completed: {os.path.basename(backup_file)} ({size_mb:.1f} MB)"
-            
+
         except subprocess.TimeoutExpired:
             if os.path.exists(backup_file):
                 os.remove(backup_file)
@@ -156,6 +164,119 @@ class SystemBackup:
             if os.path.exists(backup_file):
                 os.remove(backup_file)
             return False, f"Backup error: {str(e)}"
+
+    def _create_rsync_snapshot(self, progress_callback=None) -> tuple[bool, str]:
+        """
+        Create an rsync-based snapshot of a configured source_path.
+        Requires backup.source_path in config.
+        Creates a tar.gz of the snapshot for upload.
+        """
+        source_path = self.backup_config.get('source_path')
+        if not source_path:
+            return False, "rsync mode requires 'source_path' in backup config"
+
+        snapshots_root = os.path.join(self.local_path, 'snapshots')
+        os.makedirs(snapshots_root, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        snapshot_name = f"snapshot-{timestamp}"
+        snapshot_path = os.path.join(snapshots_root, snapshot_name)
+
+        # Find latest snapshot for link-dest
+        latest = None
+        try:
+            entries = [d for d in os.listdir(snapshots_root) if d.startswith('snapshot-')]
+            entries.sort(reverse=True)
+            if entries:
+                latest = os.path.join(snapshots_root, entries[0])
+        except Exception:
+            latest = None
+
+        rsync_cmd = ['rsync', '-a', '--delete']
+        if latest:
+            rsync_cmd += ['--link-dest', latest]
+        rsync_cmd += [source_path.rstrip('/') + '/', snapshot_path]
+
+        try:
+            if progress_callback:
+                progress_callback("Creating rsync snapshot...")
+
+            result = subprocess.run(rsync_cmd, capture_output=True, text=True, timeout=7200)
+            if result.returncode != 0:
+                return False, f"rsync failed: {result.stderr}"
+
+            # Tar the snapshot for upload
+            backup_file = os.path.join(self.local_path, f"raspi-backup-{timestamp}-rsync.tar.gz")
+            tar_cmd = ['tar', '-C', snapshots_root, '-czf', backup_file, snapshot_name]
+            if progress_callback:
+                progress_callback("Archiving snapshot...")
+            result = subprocess.run(tar_cmd, capture_output=True, text=True, timeout=3600)
+            if result.returncode != 0:
+                return False, f"tar failed: {result.stderr}"
+
+            size = os.path.getsize(backup_file)
+
+            if self.cloud_enabled:
+                if progress_callback:
+                    progress_callback("Uploading to cloud storage...")
+                cloud_success, cloud_msg = self.upload_to_cloud(backup_file, progress_callback)
+                if not cloud_success:
+                    logger.warning(f"Cloud upload failed: {cloud_msg}")
+
+            # Clean up old tar backup files
+            old_backup = self.get_latest_backup()
+            if old_backup and os.path.basename(old_backup) != os.path.basename(backup_file):
+                try:
+                    os.remove(old_backup)
+                    if self.cloud_enabled:
+                        self.remove_from_cloud(os.path.basename(old_backup))
+                except Exception:
+                    pass
+
+            status = self.load_status()
+            status['last_backup'] = datetime.now().isoformat()
+            status['last_success'] = datetime.now().isoformat()
+            status['latest_file'] = os.path.basename(backup_file)
+            status['latest_size'] = size
+            status['cloud_sync'] = self.cloud_enabled
+            self.save_status(status)
+
+            return True, f"Snapshot completed: {os.path.basename(backup_file)} ({size/1024/1024:.1f} MB)"
+
+        except subprocess.TimeoutExpired:
+            return False, "rsync/tar timed out"
+        except Exception as e:
+            return False, f"Snapshot error: {e}"
+
+    def _create_restic_snapshot(self, progress_callback=None) -> tuple[bool, str]:
+        """
+        Create a restic snapshot. Requires restic in PATH and RESTIC_PASSWORD env set or config.
+        """
+        restic_repo = self.backup_config.get('restic_repo')
+        source_path = self.backup_config.get('source_path')
+        if not restic_repo or not source_path:
+            return False, "restic mode requires 'restic_repo' and 'source_path' in backup config"
+
+        try:
+            if progress_callback:
+                progress_callback("Running restic backup...")
+            cmd = ['restic', '-r', restic_repo, 'backup', source_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+            if result.returncode != 0:
+                return False, f"restic failed: {result.stderr}"
+
+            status = self.load_status()
+            status['last_backup'] = datetime.now().isoformat()
+            status['last_success'] = datetime.now().isoformat()
+            status['latest_file'] = f"restic:{source_path}"
+            status['latest_size'] = 0
+            status['cloud_sync'] = True
+            self.save_status(status)
+
+            return True, "Restic backup completed"
+        except subprocess.TimeoutExpired:
+            return False, "restic timed out"
+        except Exception as e:
+            return False, f"restic error: {e}"
     
     def upload_to_cloud(self, local_file: str, progress_callback=None) -> tuple[bool, str]:
         """
