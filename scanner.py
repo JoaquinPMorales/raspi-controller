@@ -185,6 +185,23 @@ class FolderScanner:
         except Exception:
             pass
         return 0
+
+    async def get_item_size_async(self, path: str) -> int:
+        """Async variant using async_helpers to run remote du without blocking."""
+        try:
+            try:
+                from . import async_helpers
+            except Exception:
+                import async_helpers
+
+            cmd = f'du -sb "{path}" 2>/dev/null | cut -f1'
+            rc, stdout, stderr = await async_helpers.async_paramiko_exec(self.ssh, cmd)
+            out = (stdout or "").strip()
+            if out and out.isdigit():
+                return int(out)
+        except Exception:
+            pass
+        return 0
     
     def calculate_items_size(self, items: list) -> int:
         """Calculate total size of multiple items."""

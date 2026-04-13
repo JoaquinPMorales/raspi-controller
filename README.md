@@ -560,6 +560,38 @@ sudo systemctl restart jellyfin-bot
 - **No Move/Delete**: Script only copies, never moves or deletes source files
 - **Git Ignore**: `config.yaml` is automatically excluded from git (contains passwords)
 
+## Developer / Tests
+
+If you're contributing or running the project locally, follow these steps to set up a development environment and run tests:
+
+1. Create and activate a virtual environment:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+2. Install dependencies (including test deps):
+```bash
+pip install -r requirements.txt
+```
+
+3. Run the full test suite:
+```bash
+pytest -q
+```
+
+4. Run a single test file:
+```bash
+pytest -q tests/test_async_helpers.py
+```
+
+Notes:
+- The project uses pytest and pytest-asyncio for async tests.
+- Tests in tests/ temporarily add the project root to PYTHONPATH to import local modules.
+- Recently added async helpers: async_helpers.py (async_run_cmd, async_call, async_paramiko_exec).
+- Tests added: tests/test_async_helpers.py and tests/test_async_paramiko_and_timeouts.py.
+
+
 ## License
 
 MIT License - Feel free to modify and distribute.

@@ -73,6 +73,24 @@ class SystemUpdater:
             
         except Exception as e:
             return False, str(e)
+
+    async def _run_sudo_command_async(self, command: str, console: Console, description: str) -> tuple:
+        """Async variant using async_helpers to avoid blocking the event loop."""
+        try:
+            try:
+                from . import async_helpers
+            except Exception:
+                import async_helpers
+
+            full_command = f'echo "{self.sudo_password}" | sudo -S {command}'
+            rc, stdout, stderr = await async_helpers.async_paramiko_exec(self.ssh, full_command)
+            if stdout:
+                for line in stdout.splitlines():
+                    console.print(f"[dim]{line.rstrip()}[/dim]")
+            error = (stderr or "").strip()
+            return rc == 0, error
+        except Exception as e:
+            return False, str(e)
     
     def _run_command(self, command: str, console: Console, description: str) -> tuple:
         """Run a command and stream output to console."""
