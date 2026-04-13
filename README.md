@@ -689,6 +689,41 @@ pytest -q tests/test_async_helpers.py
 
 Notes:
 - The project uses pytest and pytest-asyncio for async tests.
+
+## Observability (Logging & Alerts)
+
+This project includes a lightweight observability helper module (`logger.py`) and a small alerts helper (`alerts.py`). Use them to produce structured logs and to send critical notifications via Telegram.
+
+Logging
+
+- Configure logging in `config.yaml` under the `logging` section (see `config.yaml.example`):
+
+```yaml
+logging:
+  level: "INFO"         # DEBUG, INFO, WARNING, ERROR
+  json: false            # true to enable structured JSON logs
+  file: null             # e.g. "/var/log/raspi-controller.log"
+  max_bytes: 10485760    # rotation size in bytes
+  backup_count: 5        # number of rotated files to keep
+```
+
+- Example usage from code:
+```py
+from logger import get_logger
+logger = get_logger(__name__, json_format=True, log_file='/var/log/raspi-controller.log')
+logger.info('Started')
+```
+
+Alerts (Telegram)
+
+- Use `alerts.send_telegram_alert(token, chat_id, text)` to send messages via the Bot API.
+- A convenience helper `alerts.notify_config(config, text)` will use `backup.alert_chat_id` or the first `telegram.allowed_users` entry if present.
+- To receive backup failure alerts, add `backup.alert_chat_id: 123456789` to your config and ensure `telegram.token` is configured.
+
+Tests
+
+- Unit tests for the formatter and alerts helper are included in `tests/test_logger.py` and `tests/test_alerts.py`.
+
 - Tests in tests/ temporarily add the project root to PYTHONPATH to import local modules.
 - Recently added async helpers: async_helpers.py (async_run_cmd, async_call, async_paramiko_exec).
 - Tests added: tests/test_async_helpers.py and tests/test_async_paramiko_and_timeouts.py.

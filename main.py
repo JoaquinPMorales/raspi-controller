@@ -321,6 +321,53 @@ def main():
     config = load_config()
     if not validate_config(config):
         sys.exit(1)
+
+    # Configure logging from config (observability)
+    try:
+        from logger import configure_from_config, get_logger, get_logger_adapter, new_op_id
+        configure_from_config(config)
+        base_logger = get_logger(__name__)
+        op_id = new_op_id()
+        logger = get_logger_adapter(__name__, op_id=op_id)
+        base_logger.info(f"Starting operation {op_id}")
+    except Exception:
+        logger = None
+        op_id = None
+
+    # Global exception hook and asyncio exception handler to surface unhandled errors via alerts
+    try:
+        import traceback, asyncio, sys as _sys
+
+        def _handle_unhandled_exception(exc_type, exc_value, exc_tb):
+            tb = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            msg = f"Unhandled exception (op_id={op_id}): {tb}"
+            if logger:
+                logger.exception(msg)
+            try:
+                from alerts import notify_config
+                notify_config(config, msg)
+            except Exception:
+                pass
+
+        _sys.excepthook = _handle_unhandled_exception
+
+        def _async_exception_handler(loop, context):
+            msg = f"Async exception (op_id={op_id}): {context.get('message')} {context.get('exception')}"
+            if logger:
+                logger.error(msg)
+            try:
+                from alerts import notify_config
+                notify_config(config, msg)
+            except Exception:
+                pass
+
+        try:
+            loop = asyncio.get_event_loop()
+            loop.set_exception_handler(_async_exception_handler)
+        except Exception:
+            pass
+    except Exception:
+        pass
     
     # Handle update mode separately (no scanning needed)
     if mode == 'update':

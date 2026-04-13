@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
+try:
+    from alerts import notify_config
+except Exception:
+    def notify_config(cfg, text):
+        return False, "alerts not available"
 
 
 class SystemBackup:
@@ -120,6 +125,10 @@ class SystemBackup:
             if result.returncode != 0:
                 if os.path.exists(backup_file):
                     os.remove(backup_file)
+                try:
+                    notify_config(self.config, f"Backup failed: {result.stderr}")
+                except Exception:
+                    pass
                 return False, f"Backup failed: {result.stderr}"
 
             size = os.path.getsize(backup_file)
@@ -153,6 +162,11 @@ class SystemBackup:
             status['latest_size'] = size
             status['cloud_sync'] = self.cloud_enabled
             self.save_status(status)
+
+            try:
+                notify_config(self.config, f"Backup completed: {os.path.basename(backup_file)} ({size_mb:.1f} MB)")
+            except Exception:
+                pass
 
             return True, f"Backup completed: {os.path.basename(backup_file)} ({size_mb:.1f} MB)"
 
@@ -202,6 +216,10 @@ class SystemBackup:
 
             result = subprocess.run(rsync_cmd, capture_output=True, text=True, timeout=7200)
             if result.returncode != 0:
+                try:
+                    notify_config(self.config, f"rsync failed: {result.stderr}")
+                except Exception:
+                    pass
                 return False, f"rsync failed: {result.stderr}"
 
             # Tar the snapshot for upload
@@ -211,6 +229,10 @@ class SystemBackup:
                 progress_callback("Archiving snapshot...")
             result = subprocess.run(tar_cmd, capture_output=True, text=True, timeout=3600)
             if result.returncode != 0:
+                try:
+                    notify_config(self.config, f"tar failed: {result.stderr}")
+                except Exception:
+                    pass
                 return False, f"tar failed: {result.stderr}"
 
             size = os.path.getsize(backup_file)
@@ -240,6 +262,11 @@ class SystemBackup:
             status['cloud_sync'] = self.cloud_enabled
             self.save_status(status)
 
+            try:
+                notify_config(self.config, f"Snapshot completed: {os.path.basename(backup_file)} ({size/1024/1024:.1f} MB)")
+            except Exception:
+                pass
+
             return True, f"Snapshot completed: {os.path.basename(backup_file)} ({size/1024/1024:.1f} MB)"
 
         except subprocess.TimeoutExpired:
@@ -262,6 +289,10 @@ class SystemBackup:
             cmd = ['restic', '-r', restic_repo, 'backup', source_path]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
             if result.returncode != 0:
+                try:
+                    notify_config(self.config, f"restic failed: {result.stderr}")
+                except Exception:
+                    pass
                 return False, f"restic failed: {result.stderr}"
 
             status = self.load_status()
@@ -271,6 +302,11 @@ class SystemBackup:
             status['latest_size'] = 0
             status['cloud_sync'] = True
             self.save_status(status)
+
+            try:
+                notify_config(self.config, f"Restic backup completed for {source_path}")
+            except Exception:
+                pass
 
             return True, "Restic backup completed"
         except subprocess.TimeoutExpired:

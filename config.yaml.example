@@ -77,3 +77,11 @@ backup:
   # - For rsync mode, source_path is required; snapshots use hardlink snapshots via --link-dest
   # To set up Google Drive: https://rclone.org/drive/
 
+# Logging configuration (optional)
+logging:
+  level: "INFO"           # DEBUG, INFO, WARNING, ERROR
+  json: false              # true -> JSON structured logs
+  file: null               # e.g. "/var/log/raspi-controller.log"
+  max_bytes: 10485760      # rotation size in bytes (default 10MB)
+  backup_count: 5          # rotated files to keep
+
