@@ -44,7 +44,7 @@ class SystemBackup:
         
         backups = []
         for f in os.listdir(self.local_path):
-            if f.startswith('raspi-backup-') and f.endswith('.img.gz'):
+            if f.startswith('raspi-backup-') and (f.endswith('.img.gz') or f.endswith('.tar.gz')):
                 backups.append(f)
         
         if not backups:
@@ -188,6 +188,8 @@ class SystemBackup:
         source_path = self.backup_config.get('source_path')
         if not source_path:
             return False, "rsync mode requires 'source_path' in backup config"
+        if not os.path.exists(source_path):
+            return False, f"rsync source_path does not exist: {source_path}"
 
         snapshots_root = os.path.join(self.local_path, 'snapshots')
         os.makedirs(snapshots_root, exist_ok=True)
@@ -282,6 +284,8 @@ class SystemBackup:
         source_path = self.backup_config.get('source_path')
         if not restic_repo or not source_path:
             return False, "restic mode requires 'restic_repo' and 'source_path' in backup config"
+        if not os.path.exists(source_path):
+            return False, f"restic source_path does not exist: {source_path}"
 
         try:
             if progress_callback:

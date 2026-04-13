@@ -345,7 +345,7 @@ def main():
                 logger.exception(msg)
             try:
                 from alerts import notify_config
-                notify_config(config, msg)
+                notify_config(config, msg[:4000] + ("…" if len(msg) > 4000 else ""))
             except Exception:
                 pass
 
@@ -357,7 +357,7 @@ def main():
                 logger.error(msg)
             try:
                 from alerts import notify_config
-                notify_config(config, msg)
+                notify_config(config, msg[:4000] + ("…" if len(msg) > 4000 else ""))
             except Exception:
                 pass
 

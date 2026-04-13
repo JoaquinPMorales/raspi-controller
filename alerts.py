@@ -48,7 +48,8 @@ def send_telegram_alert(token: str, chat_id: str, text: str, parse_mode: str = "
 def notify_config(config: Optional[Dict[str, Any]], text: str) -> Tuple[bool, str]:
     """Helper that reads telegram config from the project config and sends an alert.
 
-    It prefers a backup.alert_chat_id if present, otherwise uses the first entry in telegram.allowed_users.
+    Sends to backup.alert_chat_id if present, then to all entries in telegram.allowed_users.
+    Returns (True, "ok") if at least one message was delivered, otherwise (False, last_error).
     """
     if not config:
         return False, "No config provided"
@@ -56,16 +57,29 @@ def notify_config(config: Optional[Dict[str, Any]], text: str) -> Tuple[bool, st
     token = tg.get("token")
     allowed = tg.get("allowed_users", []) or []
 
-    # allow override in backup config
+    recipients: list = []
     backup_cfg = config.get("backup", {}) or {}
-    chat_id = backup_cfg.get("alert_chat_id")
-    if not chat_id:
-        if allowed:
-            chat_id = allowed[0]
-    if not chat_id:
+    alert_chat_id = backup_cfg.get("alert_chat_id")
+    if alert_chat_id:
+        recipients.append(str(alert_chat_id))
+    for uid in allowed:
+        uid_str = str(uid)
+        if uid_str not in recipients:
+            recipients.append(uid_str)
+
+    if not recipients:
         return False, "No chat_id available in config (set backup.alert_chat_id or telegram.allowed_users)"
 
-    return send_telegram_alert(token, str(chat_id), text)
+    last_error = ""
+    any_ok = False
+    for chat_id in recipients:
+        ok, msg = send_telegram_alert(token, chat_id, text)
+        if ok:
+            any_ok = True
+        else:
+            last_error = msg
+
+    return (True, "ok") if any_ok else (False, last_error)
 
 
 __all__ = ["send_telegram_alert", "notify_config"]
