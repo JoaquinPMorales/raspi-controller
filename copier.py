@@ -4,6 +4,8 @@ Rsync copier module for copying TV series and movies to Jellyfin with progress m
 
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -14,6 +16,29 @@ from dataclasses import dataclass
 import paramiko
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+
+
+def _resolve_rsync_bin() -> str:
+    """Resolve the rsync binary to execute on the current machine."""
+    env_rsync_bin = os.environ.get('RSYNC_BIN')
+    if env_rsync_bin:
+        expanded = os.path.expanduser(env_rsync_bin)
+        if os.path.exists(expanded):
+            return expanded
+        raise FileNotFoundError(f"Configured RSYNC_BIN was not found: {expanded}")
+
+    rsync_bin = shutil.which('rsync')
+    if rsync_bin:
+        return rsync_bin
+
+    for candidate in ('/usr/bin/rsync', '/usr/local/bin/rsync', '/opt/homebrew/bin/rsync'):
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "rsync is required on the machine running this script. "
+        "Install rsync locally or set RSYNC_BIN to its full path."
+    )
 
 
 @dataclass
@@ -72,7 +97,7 @@ class RsyncCopier:
         if src.rstrip('/').lower().endswith(tuple(self._VIDEO_EXTENSIONS)):
             src = src.rstrip('/')
         
-        return ['/usr/bin/rsync'] + flags + [src, dst]
+        return [_resolve_rsync_bin()] + flags + [src, dst]
     
     def _build_rsync_command(self, source: str, destination: str, source_is_dir: bool = True) -> str:
         """Build rsync command string (used for SSH remote execution)."""
@@ -491,50 +516,20 @@ class RsyncCopier:
 
 
 class ExternalCopier:
-    """Handles copying files from Pi to local laptop via SFTP."""
+    """Handles copying files from Pi to local laptop via rsync over SSH."""
     
     def __init__(self, pi_config: dict, paths_config: dict, options_config: dict):
         self.pi_config = pi_config
         self.paths_config = paths_config
         self.options_config = options_config
         self.cancelled = False
-        self.ssh = None
-        self.sftp = None
+        self.active_process = None
     
     def cancel(self):
         """Signal cancellation of ongoing operations."""
         self.cancelled = True
-    
-    def _connect(self) -> bool:
-        """Establish SSH connection."""
-        try:
-            self.ssh = paramiko.SSHClient()
-            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            connect_kwargs = {
-                'hostname': self.pi_config['host'],
-                'port': self.pi_config.get('port', 22),
-                'username': self.pi_config['user'],
-                'timeout': 10,
-            }
-            
-            key_path = self.pi_config.get('key_path')
-            if key_path:
-                key_path = os.path.expanduser(key_path)
-                if os.path.exists(key_path):
-                    connect_kwargs['key_filename'] = key_path
-            
-            password = self.pi_config.get('password')
-            if password:
-                connect_kwargs['password'] = password
-            
-            self.ssh.connect(**connect_kwargs)
-            self.sftp = self.ssh.open_sftp()
-            return True
-            
-        except Exception as e:
-            print(f"SSH connection failed: {e}")
-            return False
+        if self.active_process and self.active_process.poll() is None:
+            self.active_process.terminate()
     
     def _get_local_destination(self, item: Dict) -> str:
         """Determine the local destination path."""
@@ -550,161 +545,161 @@ class ExternalCopier:
                 return os.path.join(dest_base, 'TV', show_name)
         else:
             return os.path.join(dest_base, 'Movies', show_name)
-    
-    def _copy_file_with_progress(self, remote_path: str, local_path: str, console: Console, progress: Progress, task_id: int, display_name: str, filename: str) -> bool:
-        """Copy a single file with progress updates using chunked reads."""
+
+    def _get_source_is_dir(self, item: Dict) -> bool:
+        """Infer whether the selected item is a directory from scanner metadata."""
+        item_list = item.get('items') or [item]
+        source_type = item_list[0].get('type')
+        return source_type == 'folder'
+
+    def _build_rsync_transport(self) -> tuple[str, dict]:
+        """Build the rsync SSH transport command and environment."""
+        ssh_args = [
+            'ssh',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-p', str(self.pi_config.get('port', 22)),
+        ]
+
+        env = os.environ.copy()
+        password = self.pi_config.get('password')
+        key_path = self.pi_config.get('key_path')
+
+        if key_path:
+            expanded_key_path = os.path.expanduser(key_path)
+            if os.path.exists(expanded_key_path):
+                ssh_args.extend(['-i', expanded_key_path])
+            elif not password:
+                raise FileNotFoundError(f"SSH key not found at {expanded_key_path}")
+
+        if password and ('-i' not in ssh_args):
+            sshpass_path = shutil.which('sshpass')
+            if not sshpass_path:
+                raise RuntimeError(
+                    "sshpass is required for password-based external rsync copies. "
+                    "Install sshpass or configure pi.key_path."
+                )
+            env['SSHPASS'] = password
+            ssh_args = [sshpass_path, '-e'] + ssh_args
+
+        return ' '.join(shlex.quote(arg) for arg in ssh_args), env
+
+    def _build_rsync_args(self, source: str, destination: str, source_is_dir: bool = True) -> tuple[list, dict]:
+        """Build rsync args for pulling files from the Pi to the local machine."""
+        dry_run = self.options_config.get('dry_run', False)
+        bwlimit = self.options_config.get('bwlimit')
+        preserve_permissions = self.options_config.get('preserve_permissions', True)
+
+        flags = ['-rlt', '-h', '--partial', '--progress', '--stats', '--protect-args', '--no-owner', '--no-group']
+        flags.append('--perms' if preserve_permissions else '--no-perms')
+
+        if dry_run:
+            flags.append('--dry-run')
+
+        if bwlimit:
+            flags.append(f'--bwlimit={bwlimit}')
+
+        transport_cmd, env = self._build_rsync_transport()
+        remote_path = source.rstrip('/') + '/' if source_is_dir else source.rstrip('/')
+        remote_source = (
+            f"{self.pi_config['user']}@{self.pi_config['host']}:"
+            f"{remote_path}"
+        )
+        local_destination = destination.rstrip('/') + '/'
+
+        args = [_resolve_rsync_bin()] + flags + ['-e', transport_cmd, remote_source, local_destination]
+        return args, env
+
+    def _parse_rsync_progress(self, line: str) -> Optional[Dict]:
+        """Parse rsync progress output."""
+        progress_pattern = r'^\s*(\S+)\s+(\d+)%\s+(\S+)\s+(\S+)'
+        match = re.match(progress_pattern, line)
+
+        if match:
+            return {
+                'bytes': match.group(1),
+                'percent': int(match.group(2)),
+                'speed': match.group(3),
+                'eta': match.group(4)
+            }
+
+        return None
+
+    def _copy_with_rsync(
+        self,
+        source_path: str,
+        dest_path: str,
+        console: Console,
+        progress: Progress,
+        task_id: int,
+        display_name: str,
+        progress_callback=None,
+        source_is_dir: bool = True,
+    ) -> bool:
+        """Copy a single item from Pi to local machine using rsync."""
         try:
-            # Get remote file size
-            remote_stat = self.sftp.stat(remote_path)
-            total_size = remote_stat.st_size
-            
-            if total_size == 0:
-                # Empty file, just create it
-                open(local_path, 'w').close()
-                progress.update(task_id, completed=100)
-                return True
-            
-            # Open remote and local files
-            with self.sftp.file(remote_path, 'rb') as remote_file:
-                # Create temp file first, rename on success
-                temp_path = local_path + '.part'
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                
-                copied_size = 0
-                chunk_size = 256 * 1024  # 256 KB chunks for good throughput
-                
-                with open(temp_path, 'wb') as local_file:
-                    while not self.cancelled:
-                        data = remote_file.read(chunk_size)
-                        if not data:
-                            break
-                        
-                        local_file.write(data)
-                        copied_size += len(data)
-                        
-                        # Update progress
-                        percent = min(int((copied_size / total_size) * 100), 99)
-                        progress.update(
-                            task_id, 
-                            completed=percent,
-                            description=f"[cyan]{display_name}[/cyan] - {filename[:30]} ({percent}%)"
-                        )
-                
+            os.makedirs(dest_path, exist_ok=True)
+            args, env = self._build_rsync_args(source_path, dest_path, source_is_dir=source_is_dir)
+
+            process = subprocess.Popen(
+                args,
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+            self.active_process = process
+            current_file = ""
+
+            if progress_callback:
+                progress_callback(0, "", "", "")
+
+            while True:
                 if self.cancelled:
-                    # Clean up partial file
-                    try:
-                        os.remove(temp_path)
-                    except:
-                        pass
+                    process.terminate()
                     return False
-                
-                # Rename temp file to final name
-                os.replace(temp_path, local_path)
+
+                line = process.stdout.readline()
+                if not line:
+                    break
+
+                line = line.strip()
+
+                if line and not line[0].isspace() and not line.startswith('rsync'):
+                    if not line.startswith('sending') and not line.startswith('receiving'):
+                        current_file = Path(line).name
+                        progress.update(task_id, description=f"[cyan]{display_name}[/cyan] - {current_file[:40]}")
+
+                progress_info = self._parse_rsync_progress(line)
+                if progress_info:
+                    percent = progress_info['percent']
+                    progress.update(task_id, completed=percent)
+                    if progress_callback:
+                        progress_callback(percent, current_file, progress_info['speed'], progress_info['eta'])
+
+            exit_status = process.wait()
+            stderr_output = process.stderr.read().strip()
+
+            if self.cancelled:
+                return False
+
+            if exit_status == 0:
                 progress.update(task_id, completed=100)
+                if progress_callback:
+                    progress_callback(100, current_file, "", "")
                 return True
-                
-        except Exception as e:
-            console.print(f"[red]Error copying file {filename}: {e}[/red]")
-            # Clean up partial file on error
-            try:
-                temp_path = local_path + '.part'
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except:
-                pass
+
+            error_detail = stderr_output if stderr_output else "(no stderr output)"
+            console.print(f"[red]External rsync failed (exit {exit_status}): {error_detail}[/red]")
             return False
-    
-    def _copy_directory(self, remote_path: str, local_path: str, console: Console, progress: Progress, task_id: int, display_name: str) -> bool:
-        """Recursively copy a directory from remote to local."""
-        try:
-            # Create local directory
-            os.makedirs(local_path, exist_ok=True)
-            
-            # List remote directory
-            entries = self.sftp.listdir_attr(remote_path)
-            
-            # Calculate total size for progress
-            total_size = 0
-            file_list = []
-            
-            def scan_directory(rpath, lpath, entries_list):
-                nonlocal total_size
-                for entry in entries_list:
-                    rfile = f"{rpath}/{entry.filename}"
-                    lfile = os.path.join(lpath, entry.filename)
-                    
-                    if entry.st_mode & 0o40000:  # Directory
-                        try:
-                            sub_entries = self.sftp.listdir_attr(rfile)
-                            os.makedirs(lfile, exist_ok=True)
-                            scan_directory(rfile, lfile, sub_entries)
-                        except:
-                            pass
-                    else:
-                        file_list.append((rfile, lfile, entry.filename, entry.st_size))
-                        total_size += entry.st_size
-            
-            scan_directory(remote_path, local_path, entries)
-            
-            if total_size == 0:
-                progress.update(task_id, completed=100)
-                return True
-            
-            # Copy files with byte-based progress
-            copied_total = 0
-            for rfile, lfile, filename, fsize in file_list:
-                if self.cancelled:
-                    return False
-                
-                # Copy single file
-                try:
-                    remote_stat = self.sftp.stat(rfile)
-                    temp_path = lfile + '.part'
-                    
-                    with self.sftp.file(rfile, 'rb') as remote_f:
-                        copied_file = 0
-                        chunk_size = 256 * 1024
-                        
-                        with open(temp_path, 'wb') as local_f:
-                            while not self.cancelled:
-                                data = remote_f.read(chunk_size)
-                                if not data:
-                                    break
-                                local_f.write(data)
-                                copied_file += len(data)
-                                copied_total += len(data)
-                                
-                                # Overall progress
-                                percent = min(int((copied_total / total_size) * 100), 99)
-                                progress.update(
-                                    task_id,
-                                    completed=percent,
-                                    description=f"[cyan]{display_name}[/cyan] - {filename[:30]}"
-                                )
-                        
-                        if self.cancelled:
-                            try:
-                                os.remove(temp_path)
-                            except:
-                                pass
-                            return False
-                        
-                        os.replace(temp_path, lfile)
-                        
-                except Exception as e:
-                    console.print(f"[red]Error copying {filename}: {e}[/red]")
-                    try:
-                        os.remove(temp_path)
-                    except:
-                        pass
-                    return False
-            
-            progress.update(task_id, completed=100)
-            return True
-            
+
         except Exception as e:
-            console.print(f"[red]Error copying directory: {e}[/red]")
+            console.print(f"[red]Error copying {display_name}: {e}[/red]")
             return False
+        finally:
+            self.active_process = None
     
     def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int, progress_callback=None) -> bool:
         """Copy a single item from Pi to local laptop."""
@@ -721,22 +716,18 @@ class ExternalCopier:
             display_name = show_name
         
         try:
-            # Check if source is directory or file
-            try:
-                entries = self.sftp.listdir_attr(source_path)
-                is_dir = True
-            except:
-                is_dir = False
-            
-            if is_dir:
-                return self._copy_directory(source_path, dest_path, console, progress, task_id, display_name)
-            else:
-                # Single file - use chunked copy with progress
-                filename = os.path.basename(source_path)
-                return self._copy_file_with_progress(
-                    source_path, dest_path, console, progress, task_id, display_name, filename
-                )
-                
+            source_is_dir = self._get_source_is_dir(item)
+            return self._copy_with_rsync(
+                source_path,
+                dest_path,
+                console,
+                progress,
+                task_id,
+                display_name,
+                progress_callback=progress_callback,
+                source_is_dir=source_is_dir,
+            )
+
         except Exception as e:
             console.print(f"[red]Error copying {display_name}: {e}[/red]")
             return False
@@ -761,12 +752,7 @@ class ExternalCopier:
                 console.print(f"  From: {item['path']}")
                 console.print(f"  To:   {dest}")
             return True
-        
-        # Connect to Pi
-        if not self._connect():
-            console.print("[red]Failed to connect to Pi for external copy.[/red]")
-            return False
-        
+
         all_success = True
         total_items = len(items)
         
@@ -774,73 +760,66 @@ class ExternalCopier:
         from rich.console import Console as RichConsole
         _progress_console = console if isinstance(console, RichConsole) else RichConsole(file=open(os.devnull, 'w'))
         
-        try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(bar_width=40),
-                TaskProgressColumn(),
-                "•",
-                TimeElapsedColumn(),
-                "•",
-                TimeRemainingColumn(),
-                console=_progress_console,
-                transient=False,
-            ) as progress:
-                
-                overall_task = progress.add_task(
-                    f"[bold green]Overall Progress",
-                    total=len(items)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            "•",
+            TimeElapsedColumn(),
+            "•",
+            TimeRemainingColumn(),
+            console=_progress_console,
+            transient=False,
+        ) as progress:
+
+            overall_task = progress.add_task(
+                f"[bold green]Overall Progress",
+                total=len(items)
+            )
+
+            for i, item in enumerate(items, 1):
+                if self.cancelled:
+                    console.print("\n[yellow]Operation cancelled by user.[/yellow]")
+                    return False
+
+                show_name = item['show']
+                season = item.get('season')
+                content_type = item.get('content_type', 'movie')
+
+                if content_type == 'tv' and season:
+                    display_name = f"{show_name} S{season}"
+                else:
+                    display_name = show_name
+
+                task_id = progress.add_task(
+                    f"[cyan]{display_name}[/cyan]",
+                    total=100,
+                    visible=True
                 )
-                
-                for i, item in enumerate(items, 1):
-                    if self.cancelled:
-                        console.print("\n[yellow]Operation cancelled by user.[/yellow]")
-                        return False
-                    
-                    show_name = item['show']
-                    season = item.get('season')
-                    content_type = item.get('content_type', 'movie')
-                    
-                    if content_type == 'tv' and season:
-                        display_name = f"{show_name} S{season}"
-                    else:
-                        display_name = show_name
-                    
-                    task_id = progress.add_task(
-                        f"[cyan]{display_name}[/cyan]",
-                        total=100,
-                        visible=True
-                    )
-                    
-                    console.print(f"\n[bold]{i}/{len(items)}: {display_name}[/bold]")
-                    
-                    # Track last progress percent to throttle callbacks
-                    last_callback_percent = 0
-                    
-                    def _progress_wrapper(current_percent, filename="", speed="", eta=""):
-                        nonlocal last_callback_percent
-                        # Only call back on 10% increments or first/last
-                        if progress_callback and (current_percent == 0 or current_percent >= 100 or 
-                                                   current_percent - last_callback_percent >= 10):
-                            progress_callback(i, total_items, current_percent, filename or display_name, speed, eta, 0, 0)
-                            last_callback_percent = current_percent
-                    
-                    success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper)
-                    
-                    if success:
-                        progress.update(overall_task, advance=1)
-                        console.print(f"[green]  ✓ Completed {display_name}[/green]")
-                    else:
-                        console.print(f"[red]  ✗ Failed {display_name}[/red]")
-                        all_success = False
-                    
-                    progress.remove_task(task_id)
-        
-        finally:
-            if self.sftp:
-                self.sftp.close()
-            if self.ssh:
-                self.ssh.close()
-        
+
+                console.print(f"\n[bold]{i}/{len(items)}: {display_name}[/bold]")
+
+                last_callback_percent = 0
+
+                def _progress_wrapper(current_percent, filename="", speed="", eta=""):
+                    nonlocal last_callback_percent
+                    if progress_callback and (
+                        current_percent == 0 or current_percent >= 100 or
+                        current_percent - last_callback_percent >= 10
+                    ):
+                        progress_callback(i, total_items, current_percent, filename or display_name, speed, eta, 0, 0)
+                        last_callback_percent = current_percent
+
+                success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper)
+
+                if success:
+                    progress.update(overall_task, advance=1)
+                    console.print(f"[green]  ✓ Completed {display_name}[/green]")
+                else:
+                    console.print(f"[red]  ✗ Failed {display_name}[/red]")
+                    all_success = False
+
+                progress.remove_task(task_id)
+
         return all_success
