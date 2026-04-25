@@ -6,11 +6,13 @@ Run this on your Raspberry Pi to control media operations from your phone.
 import os
 import sys
 import re
+import shlex
 import yaml
 import json
 import logging
 import asyncio
 import httpx
+import paramiko
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -194,6 +196,329 @@ def _run_auto_backup_cycle(config: dict) -> tuple[bool, bool, str]:
 
     success, message = backup.create_backup()
     return True, success, message
+
+
+def _open_ssh_client(pi_config: dict) -> paramiko.SSHClient:
+    """Create and connect an SSH client for short-lived blocking operations."""
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(
+        pi_config['host'],
+        port=pi_config.get('port', 22),
+        username=pi_config['user'],
+        password=pi_config.get('password'),
+        key_filename=pi_config.get('key_path'),
+    )
+    return ssh
+
+
+def _get_disk_health_report(pi_config: dict) -> str:
+    """Collect SMART health data for detected disks."""
+    sudo_password = pi_config.get('sudo_password', '')
+    ssh = _open_ssh_client(pi_config)
+
+    try:
+        _, out, _ = ssh.exec_command('lsblk -dno NAME,TYPE | grep disk')
+        detected = [f"/dev/{line.split()[0]}" for line in out.read().decode().strip().splitlines() if line.strip()]
+        drives = detected if detected else ['/dev/sda', '/dev/sdb']
+        health_info = []
+
+        for drive in drives:
+            try:
+                stdin, stdout, _ = ssh.exec_command(f'sudo -S smartctl -A -H {drive} 2>/dev/null', get_pty=True)
+                if sudo_password:
+                    stdin.write(sudo_password + '\n')
+                    stdin.flush()
+                output = stdout.read().decode()
+
+                if not output or 'No such device' in output or 'Unable to detect' in output:
+                    continue
+
+                passed = 'PASSED' in output
+                failed = 'FAILED' in output
+
+                issues = 0
+                max_issues = 0
+                temp = None
+                reallocated = 0
+                pending = 0
+                uncorrectable = 0
+                power_on_hours = None
+                wear_level = None
+
+                for line in output.splitlines():
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    try:
+                        int(parts[0])
+                    except ValueError:
+                        continue
+                    attr_name = parts[1].lower()
+                    raw_val = parts[9]
+
+                    try:
+                        raw_int = int(raw_val.split()[0])
+                    except (ValueError, IndexError):
+                        raw_int = 0
+
+                    if 'reallocated' in attr_name and 'sector' in attr_name:
+                        reallocated = raw_int
+                        max_issues += 1
+                        if raw_int > 0:
+                            issues += 1
+                    elif 'pending' in attr_name:
+                        pending = raw_int
+                        max_issues += 1
+                        if raw_int > 0:
+                            issues += 1
+                    elif 'uncorrectable' in attr_name or 'offline_uncorrect' in attr_name:
+                        uncorrectable = raw_int
+                        max_issues += 1
+                        if raw_int > 0:
+                            issues += 1
+                    elif 'temperature' in attr_name or 'airflow_temp' in attr_name:
+                        temp = raw_int
+                    elif 'power_on_hours' in attr_name or 'power_on_time' in attr_name:
+                        power_on_hours = raw_int
+                    elif 'wear_level' in attr_name or 'wearout' in attr_name or 'ssd_life' in attr_name:
+                        wear_level = int(parts[3]) if len(parts) > 3 else None
+
+                if failed:
+                    score = 0
+                elif max_issues > 0:
+                    score = max(0, round((1 - issues / max_issues) * 100))
+                else:
+                    score = 100 if passed else 70
+
+                if score >= 90:
+                    score_emoji = "🟢"
+                elif score >= 60:
+                    score_emoji = "🟡"
+                else:
+                    score_emoji = "🔴"
+
+                bar_filled = round(score / 10)
+                bar = "█" * bar_filled + "░" * (10 - bar_filled)
+                lines = [f"{score_emoji} *{drive}* — {score}% healthy", f"`[{bar}]`"]
+                lines.append(f"  {'✅' if reallocated == 0 else '⚠️'} Reallocated sectors: {reallocated}")
+                lines.append(f"  {'✅' if pending == 0 else '⚠️'} Pending sectors: {pending}")
+                lines.append(f"  {'✅' if uncorrectable == 0 else '❌'} Uncorrectable: {uncorrectable}")
+                if temp is not None:
+                    lines.append(f"  {'🌡️' if temp < 50 else '🔥'} Temp: {temp}°C")
+                if wear_level is not None:
+                    wear_emoji = "💚" if wear_level >= 80 else "💛" if wear_level >= 50 else "❤️"
+                    lines.append(f"  {wear_emoji} SSD Wear: {wear_level}% remaining")
+                if power_on_hours is not None:
+                    lines.append(f"  ⏱️ Power-on: {power_on_hours}h ({power_on_hours // 24}d)")
+
+                health_info.append("\n".join(lines))
+            except Exception:
+                continue
+
+        if health_info:
+            return "🩺 *Disk Health Report*\n\n" + "\n\n".join(health_info)
+        return "⚠️ Could not retrieve disk health.\nMake sure smartmontools is installed:\n`sudo apt install smartmontools`"
+    finally:
+        ssh.close()
+
+
+def _get_service_status_lines(pi_config: dict) -> List[str]:
+    """Collect service status lines via SSH."""
+    ssh = _open_ssh_client(pi_config)
+    try:
+        services = {
+            'Jellyfin': ['jellyfin'],
+            'qBittorrent': ['qbittorrent-nox', 'qbittorrent'],
+            'Plex': ['plexmediaserver'],
+            'Samba': ['smbd'],
+        }
+
+        results = []
+        for name, possible_names in services.items():
+            status = None
+            for svc in possible_names:
+                try:
+                    _, stdout, _ = ssh.exec_command(f'systemctl is-active {svc} 2>/dev/null')
+                    output = stdout.read().decode().strip()
+                    if output == 'active':
+                        status = "✅ Running"
+                        break
+                    if output in ('inactive', 'failed', 'activating', 'deactivating'):
+                        status = "❌ Stopped"
+                        break
+                except Exception:
+                    continue
+            if status is None:
+                status = "⚫ Not installed"
+            results.append(f"{name}: {status}")
+
+        return results
+    finally:
+        ssh.close()
+
+
+def _get_temperature_report(pi_config: dict) -> str:
+    """Read CPU temperature over SSH and format a status message."""
+    ssh = _open_ssh_client(pi_config)
+    try:
+        _, stdout, _ = ssh.exec_command('cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo "N/A"')
+        temp_raw = stdout.read().decode().strip()
+
+        if temp_raw == "N/A":
+            return "❌ Could not read temperature sensor"
+
+        temp_c = int(temp_raw) / 1000
+        if temp_c < 60:
+            status = "✅ Normal"
+        elif temp_c < 75:
+            status = "⚠️ Warm"
+        elif temp_c < 85:
+            status = "🔥 Hot"
+        else:
+            status = "❌ Critical"
+
+        return f"🌡️ *CPU Temperature*\n\n{temp_c:.1f}°C ({temp_c * 9/5 + 32:.1f}°F)\n{status}"
+    finally:
+        ssh.close()
+
+
+def _get_cpu_report(pi_config: dict) -> str:
+    """Read CPU load and process data over SSH."""
+    ssh = _open_ssh_client(pi_config)
+    try:
+        _, stdout, _ = ssh.exec_command("uptime | awk -F'load average:' '{print $2}'")
+        load_avg = stdout.read().decode().strip()
+
+        _, stdout, _ = ssh.exec_command("nproc")
+        cores = stdout.read().decode().strip()
+
+        _, stdout, _ = ssh.exec_command("top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1")
+        cpu_percent = stdout.read().decode().strip()
+
+        _, stdout, _ = ssh.exec_command("ps aux --sort=-%cpu | head -6 | tail -5 | awk '{printf \"%.1f%% %s\\n\", $3, $11}'")
+        top_processes = stdout.read().decode().strip()
+
+        result = "⚙️ *CPU Status*\n\n"
+        result += f"*Load Average:* {load_avg}\n"
+        result += f"*Cores:* {cores}\n"
+        if cpu_percent:
+            result += f"*Usage:* {cpu_percent}%\n\n"
+        result += f"*Top Processes:*\n```{top_processes}```"
+        return result
+    finally:
+        ssh.close()
+
+
+def _get_memory_report(pi_config: dict) -> str:
+    """Read memory usage data over SSH."""
+    ssh = _open_ssh_client(pi_config)
+    try:
+        _, stdout, _ = ssh.exec_command("free -h | grep '^Mem:'")
+        mem_line = stdout.read().decode().strip()
+
+        if not mem_line:
+            return "❌ Could not read memory info"
+
+        parts = mem_line.split()
+        total = parts[1]
+        used = parts[2]
+        free = parts[3]
+        buff_cache = parts[5]
+        available = parts[6]
+
+        _, stdout, _ = ssh.exec_command("free | grep '^Mem:' | awk '{printf \"%.0f\", $3/$2 * 100.0}'")
+        used_percent = stdout.read().decode().strip()
+        filled = int(int(used_percent) / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+
+        result = "🧠 *Memory Usage*\n\n"
+        result += f"{bar} {used_percent}%\n\n"
+        result += f"*Total:* {total}\n"
+        result += f"*Used:* {used}\n"
+        result += f"*Free:* {free}\n"
+        result += f"*Available:* {available}\n"
+        result += f"*Cache:* {buff_cache}"
+        return result
+    finally:
+        ssh.close()
+
+
+def _reboot_pi(pi_config: dict) -> None:
+    """Send a reboot command over SSH."""
+    ssh = _open_ssh_client(pi_config)
+    try:
+        stdin, _, _ = ssh.exec_command('sudo -S reboot 2>&1', get_pty=True)
+        sudo_password = pi_config.get('sudo_password', '')
+        if sudo_password:
+            stdin.write(sudo_password + '\n')
+            stdin.flush()
+    finally:
+        ssh.close()
+
+
+def _run_speed_test(pi_config: dict) -> tuple[bool, str]:
+    """Run a speed test on the Pi and return formatted output."""
+    ssh = _open_ssh_client(pi_config)
+    try:
+        _, stdout, _ = ssh.exec_command('which speedtest-cli || echo "not_installed"')
+        check = stdout.read().decode().strip()
+
+        if 'not_installed' in check:
+            ssh.exec_command('sudo apt update && sudo apt install -y speedtest-cli')
+
+        _, stdout, _ = ssh.exec_command('speedtest-cli --simple', timeout=90)
+        output = stdout.read().decode().strip()
+        return bool(output), output
+    finally:
+        ssh.close()
+
+
+def _search_downloads(pi_config: dict, downloads_path: str, query: str) -> tuple[bool, Optional[List[str]], str]:
+    """Search the downloads path over SSH and return display lines."""
+    ssh = _open_ssh_client(pi_config)
+    try:
+        quoted_path = shlex.quote(downloads_path)
+        _, stdout, _ = ssh.exec_command(f'test -d {quoted_path} && echo "ok" || echo "missing"')
+        path_ok = stdout.read().decode().strip() == 'ok'
+        if not path_ok:
+            return False, None, downloads_path
+
+        escaped_query = shlex.quote(query)
+        search_cmd = (
+            f'find {quoted_path} -maxdepth 3 \\( -type d -o -type f \\) 2>/dev/null '
+            f'| grep -iv "sample\\|featurette\\|\\.srt\\|\\.sub\\|\\.nfo\\|\\.jpg\\|\\.png" '
+            f'| grep -i {escaped_query} | head -30'
+        )
+        _, stdout, _ = ssh.exec_command(search_cmd)
+
+        results = []
+        seen_titles = set()
+        for item in stdout.read().decode().strip().splitlines():
+            if not item or item == downloads_path:
+                continue
+
+            rel_path = item[len(downloads_path):].lstrip('/')
+            parts = rel_path.split('/')
+
+            if len(parts) >= 2 and '.' not in parts[0]:
+                title = parts[0]
+                icon = "📺"
+            else:
+                title = parts[0]
+                title = re.sub(r'[\(\[\{]\d{4}[\)\]\}]', '', title)
+                title = re.sub(r'[\(\[\{].*?[\)\]\}]', '', title)
+                title = title.replace('.', ' ').replace('_', ' ').strip()
+                icon = "🎬"
+
+            clean_title = ' '.join(title.lower().split())
+            if clean_title and clean_title not in seen_titles:
+                seen_titles.add(clean_title)
+                results.append(f"{icon} {title.strip()}")
+
+        return True, results, downloads_path
+    finally:
+        ssh.close()
 
 
 # Command handlers
@@ -930,146 +1255,10 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     
     await update.message.reply_text("🔍 Checking disk health...")
-    
-    import paramiko
-    pi_config = config['pi']
-    
-    sudo_password = pi_config.get('sudo_password', '')
-    
+
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            pi_config['host'],
-            port=pi_config.get('port', 22),
-            username=pi_config['user'],
-            password=pi_config.get('password'),
-            key_filename=pi_config.get('key_path')
-        )
-        
-        # Detect existing drives first
-        _, out, _ = ssh.exec_command('lsblk -dno NAME,TYPE | grep disk')
-        detected = [f"/dev/{line.split()[0]}" for line in out.read().decode().strip().splitlines() if line.strip()]
-        drives = detected if detected else ['/dev/sda', '/dev/sdb']
-        health_info = []
-        
-        for drive in drives:
-            try:
-                # Get full SMART attributes
-                stdin, stdout, _ = ssh.exec_command(f'sudo -S smartctl -A -H {drive} 2>/dev/null', get_pty=True)
-                if sudo_password:
-                    stdin.write(sudo_password + '\n')
-                    stdin.flush()
-                output = stdout.read().decode()
-                
-                if not output or 'No such device' in output or 'Unable to detect' in output:
-                    continue
-                
-                # Overall health
-                passed = 'PASSED' in output
-                failed = 'FAILED' in output
-                
-                # Parse key SMART attributes
-                issues = 0
-                max_issues = 0
-                temp = None
-                reallocated = 0
-                pending = 0
-                uncorrectable = 0
-                power_on_hours = None
-                wear_level = None  # SSD wear % (100 = new, 0 = worn out)
-                
-                for line in output.splitlines():
-                    parts = line.split()
-                    # SMART attribute lines: ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
-                    if len(parts) < 10:
-                        continue
-                    try:
-                        int(parts[0])  # first col is numeric ID
-                    except ValueError:
-                        continue
-                    attr_name = parts[1].lower()
-                    raw_val = parts[9]  # RAW_VALUE is always column index 9
-                    
-                    try:
-                        raw_int = int(raw_val.split()[0])
-                    except (ValueError, IndexError):
-                        raw_int = 0
-                    
-                    if 'reallocated' in attr_name and 'sector' in attr_name:
-                        reallocated = raw_int
-                        max_issues += 1
-                        if raw_int > 0:
-                            issues += 1
-                    elif 'pending' in attr_name:
-                        pending = raw_int
-                        max_issues += 1
-                        if raw_int > 0:
-                            issues += 1
-                    elif 'uncorrectable' in attr_name or 'offline_uncorrect' in attr_name:
-                        uncorrectable = raw_int
-                        max_issues += 1
-                        if raw_int > 0:
-                            issues += 1
-                    elif 'temperature' in attr_name or 'airflow_temp' in attr_name:
-                        temp = raw_int
-                    elif 'power_on_hours' in attr_name or 'power_on_time' in attr_name:
-                        power_on_hours = raw_int
-                    elif 'wear_level' in attr_name or 'wearout' in attr_name or 'ssd_life' in attr_name:
-                        # Most SSDs report wear in VALUE column (100=new, 0=dead)
-                        # Raw value sometimes has vendor-specific format, so use VALUE
-                        wear_level = int(parts[3]) if len(parts) > 3 else None
-                
-                # Calculate sanity score
-                if failed:
-                    score = 0
-                elif max_issues > 0:
-                    score = max(0, round((1 - issues / max_issues) * 100))
-                else:
-                    score = 100 if passed else 70
-                
-                # Score emoji
-                if score >= 90:
-                    score_emoji = "🟢"
-                elif score >= 60:
-                    score_emoji = "🟡"
-                else:
-                    score_emoji = "🔴"
-                
-                # Build drive summary
-                bar_filled = round(score / 10)
-                bar = "█" * bar_filled + "░" * (10 - bar_filled)
-                lines = [f"{score_emoji} *{drive}* — {score}% healthy", f"`[{bar}]`"]
-                # Always show sector counts
-                sector_emoji = "✅" if reallocated == 0 else "⚠️"
-                lines.append(f"  {sector_emoji} Reallocated sectors: {reallocated}")
-                pending_emoji = "✅" if pending == 0 else "⚠️"
-                lines.append(f"  {pending_emoji} Pending sectors: {pending}")
-                uncorr_emoji = "✅" if uncorrectable == 0 else "❌"
-                lines.append(f"  {uncorr_emoji} Uncorrectable: {uncorrectable}")
-                if temp is not None:
-                    temp_emoji = "🌡️" if temp < 50 else "🔥"
-                    lines.append(f"  {temp_emoji} Temp: {temp}°C")
-                if wear_level is not None:
-                    wear_emoji = "💚" if wear_level >= 80 else "💛" if wear_level >= 50 else "❤️"
-                    lines.append(f"  {wear_emoji} SSD Wear: {wear_level}% remaining")
-                if power_on_hours is not None:
-                    lines.append(f"  ⏱️ Power-on: {power_on_hours}h ({power_on_hours // 24}d)")
-                
-                health_info.append("\n".join(lines))
-                
-            except Exception:
-                pass
-        
-        ssh.close()
-        
-        if health_info:
-            result = "🩺 *Disk Health Report*\n\n" + "\n\n".join(health_info)
-        else:
-            result = "⚠️ Could not retrieve disk health.\nMake sure smartmontools is installed:\n`sudo apt install smartmontools`"
-        
+        result = await _run_blocking(_get_disk_health_report, config['pi'])
         await update.message.reply_text(result, parse_mode='Markdown')
-        
     except Exception as e:
         error_type = type(e).__name__
         await update.message.reply_text(f"❌ Error checking health: {error_type}: {str(e)}")
@@ -1086,51 +1275,10 @@ async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     
     await update.message.reply_text("🔍 Checking services...")
-    
-    import paramiko
-    pi_config = config['pi']
-    sudo_password = pi_config.get('sudo_password', '')
-    
+
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            pi_config['host'],
-            port=pi_config.get('port', 22),
-            username=pi_config['user'],
-            password=pi_config.get('password'),
-            key_filename=pi_config.get('key_path')
-        )
-        
-        # Check common service names
-        services = {
-            'Jellyfin': ['jellyfin'],
-            'qBittorrent': ['qbittorrent-nox', 'qbittorrent'],
-            'Plex': ['plexmediaserver'],
-            'Samba': ['smbd'],
-        }
-        
-        results = []
-        for name, possible_names in services.items():
-            status = None
-            for svc in possible_names:
-                try:
-                    # Check active state directly - no sudo needed for is-active
-                    _, stdout, _ = ssh.exec_command(f'systemctl is-active {svc} 2>/dev/null')
-                    output = stdout.read().decode().strip()
-                    if output == 'active':
-                        status = "✅ Running"
-                        break
-                    elif output in ('inactive', 'failed', 'activating', 'deactivating'):
-                        status = "❌ Stopped"
-                        break
-                    # empty output means service doesn't exist, try next name
-                except Exception:
-                    pass
-            if status is None:
-                status = "⚫ Not installed"
-            results.append(f"{name}: {status}")
-        
+        results = await _run_blocking(_get_service_status_lines, config['pi'])
+
         # Additional check: Try qBittorrent Web UI directly as fallback
         qb_config = config.get('qbittorrent', {})
         if qb_config.get('host') and qb_config.get('password'):
@@ -1149,12 +1297,9 @@ async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                                 break
             except Exception:
                 pass  # Web UI not accessible, keep previous status
-        
-        ssh.close()
-        
+
         result = "🔧 *Services Status*\n\n" + "\n".join(results)
         await update.message.reply_text(result, parse_mode='Markdown')
-        
     except Exception as e:
         await update.message.reply_text(f"❌ Error checking services: {str(e)}")
 
@@ -1174,28 +1319,9 @@ async def reboot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if args and args[0] == 'confirm':
         # Execute reboot
         await update.message.reply_text("🔄 Rebooting Pi...")
-        
-        import paramiko
-        pi_config = config['pi']
-        sudo_password = pi_config.get('sudo_password', '')
-        
+
         try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                pi_config['host'],
-                port=pi_config.get('port', 22),
-                username=pi_config['user'],
-                password=pi_config.get('password'),
-                key_filename=pi_config.get('key_path')
-            )
-            
-            stdin, _, _ = ssh.exec_command('sudo -S reboot 2>&1', get_pty=True)
-            if sudo_password:
-                stdin.write(sudo_password + '\n')
-                stdin.flush()
-            ssh.close()
-            
+            await _run_blocking(_reboot_pi, config['pi'])
             await update.message.reply_text("✅ Reboot command sent. The Pi will be offline for ~30 seconds.")
         except Exception as e:
             await update.message.reply_text(f"❌ Error: {str(e)}")
@@ -1219,29 +1345,10 @@ async def reboot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     if query.data == 'reboot_confirm':
         await query.edit_message_text("🔄 Rebooting Pi...")
-        
-        import paramiko
-        config = context.bot_data.get('config')
-        pi_config = config['pi']
-        sudo_password = pi_config.get('sudo_password', '')
-        
+
         try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                pi_config['host'],
-                port=pi_config.get('port', 22),
-                username=pi_config['user'],
-                password=pi_config.get('password'),
-                key_filename=pi_config.get('key_path')
-            )
-            
-            stdin, _, _ = ssh.exec_command('sudo -S reboot 2>&1', get_pty=True)
-            if sudo_password:
-                stdin.write(sudo_password + '\n')
-                stdin.flush()
-            ssh.close()
-            
+            config = context.bot_data.get('config')
+            await _run_blocking(_reboot_pi, config['pi'])
             await query.edit_message_text("✅ Reboot command sent.\nThe Pi will be offline for ~30-60 seconds.")
         except Exception as e:
             await query.edit_message_text(f"❌ Error: {str(e)}")
@@ -1401,34 +1508,11 @@ async def speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     await update.message.reply_text("🌐 Running speed test (30-60s)...")
-    
-    import paramiko
-    pi_config = config['pi']
-    
+
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            pi_config['host'],
-            port=pi_config.get('port', 22),
-            username=pi_config['user'],
-            password=pi_config.get('password'),
-            key_filename=pi_config.get('key_path')
-        )
-        
-        stdin, stdout, _ = ssh.exec_command('which speedtest-cli || echo "not_installed"')
-        check = stdout.read().decode().strip()
-        
-        if 'not_installed' in check:
-            await update.message.reply_text("📦 Installing speedtest-cli first...")
-            ssh.exec_command('sudo apt update && sudo apt install -y speedtest-cli')
-        
-        stdin, stdout, stderr = ssh.exec_command('speedtest-cli --simple', timeout=90)
-        output = stdout.read().decode().strip()
-        
-        ssh.close()
-        
-        if output:
+        success, output = await _run_blocking(_run_speed_test, config['pi'])
+
+        if success:
             lines = output.splitlines()
             result = "🚀 *Speed Test Results*\n\n"
             for line in lines:
@@ -1461,71 +1545,18 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     query = ' '.join(context.args).lower()
     await update.message.reply_text(f"🔍 Searching downloads for '*{query}*'...", parse_mode='Markdown')
-    
-    import paramiko
-    pi_config = config['pi']
-    
+
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            pi_config['host'],
-            port=pi_config.get('port', 22),
-            username=pi_config['user'],
-            password=pi_config.get('password'),
-            key_filename=pi_config.get('key_path')
-        )
-        
         downloads_path = config['paths']['downloads']
-        
-        # Verify path exists
-        _, stdout, _ = ssh.exec_command(f'test -d "{downloads_path}" && echo "ok" || echo "missing"')
-        path_ok = stdout.read().decode().strip() == 'ok'
-        
+        path_ok, results, missing_path = await _run_blocking(_search_downloads, config['pi'], downloads_path, query)
+
         if not path_ok:
             await update.message.reply_text(
-                f"❌ Downloads path not found on Pi: `{downloads_path}`\n\nCheck `paths.downloads` in config.yaml",
+                f"❌ Downloads path not found on Pi: `{missing_path}`\n\nCheck `paths.downloads` in config.yaml",
                 parse_mode='Markdown'
             )
-            ssh.close()
             return
-        
-        results = []
-        seen_titles = set()
-        
-        # Find all matching items
-        _, stdout, _ = ssh.exec_command(rf'find "{downloads_path}" -maxdepth 3 \( -type d -o -type f \) 2>/dev/null | grep -iv "sample\|featurette\|\.srt\|\.sub\|\.nfo\|\.jpg\|\.png" | grep -i "{query}" | head -30')
-        
-        for item in stdout.read().decode().strip().splitlines():
-            if not item or item == downloads_path:
-                continue
-            
-            # Get the relative path from downloads
-            rel_path = item[len(downloads_path):].lstrip('/')
-            parts = rel_path.split('/')
-            
-            # Extract title: first folder for shows, parent folder or filename for movies
-            if len(parts) >= 2 and '.' not in parts[0]:
-                # It's a show folder with seasons/episodes inside
-                title = parts[0]
-                icon = "📺"
-            else:
-                # It's a movie file or loose file
-                title = parts[0]
-                # Remove year and quality tags like (2023), [1080p], etc.
-                title = re.sub(r'[\(\[\{]\d{4}[\)\]\}]', '', title)  # Remove (2023) [2023] {2023}
-                title = re.sub(r'[\(\[\{].*?[\)\]\}]', '', title)   # Remove [1080p] (WEB-DL) etc
-                title = title.replace('.', ' ').replace('_', ' ').strip()
-                icon = "🎬"
-            
-            # Normalize for deduplication
-            clean_title = ' '.join(title.lower().split())
-            if clean_title and clean_title not in seen_titles:
-                seen_titles.add(clean_title)
-                results.append(f"{icon} {title.strip()}")
-        
-        ssh.close()
-        
+
         if results:
             result_text = f"✅ *Found in downloads:*\n\n" + "\n".join(results[:15])
             if len(results) > 15:
@@ -1893,13 +1924,7 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await progress_msg.edit_text('\n'.join(lines), parse_mode='Markdown')
     
     try:
-        from jellyfin import refresh_jellyfin_library
-        jellyfin_config = config.get('jellyfin', {})
-        refresh_success = refresh_jellyfin_library(
-            host=jellyfin_config.get('host', config['pi']['host']),
-            port=jellyfin_config.get('port', 8096),
-            api_key=jellyfin_config.get('api_key')
-        )
+        refresh_success = await _run_blocking(_refresh_jellyfin_for_bot, config)
         if refresh_success:
             await update.message.reply_text("✅ Jellyfin refreshed successfully!")
         else:
@@ -1918,46 +1943,9 @@ async def temp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_authorized(user_id, allowed_users):
         await update.message.reply_text("⛔ Unauthorized.")
         return
-    
-    import paramiko
-    pi_config = config['pi']
-    
+
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            pi_config['host'],
-            port=pi_config.get('port', 22),
-            username=pi_config['user'],
-            password=pi_config.get('password'),
-            key_filename=pi_config.get('key_path')
-        )
-        
-        # Get temperature
-        _, stdout, _ = ssh.exec_command('cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo "N/A"')
-        temp_raw = stdout.read().decode().strip()
-        
-        if temp_raw != "N/A":
-            temp_c = int(temp_raw) / 1000
-            # Determine status
-            if temp_c < 60:
-                status = "✅ Normal"
-                icon = "🌡️"
-            elif temp_c < 75:
-                status = "⚠️ Warm"
-                icon = "🌡️"
-            elif temp_c < 85:
-                status = "🔥 Hot"
-                icon = "🌡️"
-            else:
-                status = "❌ Critical"
-                icon = "🌡️"
-            
-            result = f"{icon} *CPU Temperature*\n\n{temp_c:.1f}°C ({temp_c * 9/5 + 32:.1f}°F)\n{status}"
-        else:
-            result = "❌ Could not read temperature sensor"
-        
-        ssh.close()
+        result = await _run_blocking(_get_temperature_report, config['pi'])
         await update.message.reply_text(result, parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
@@ -1972,44 +1960,9 @@ async def cpu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_authorized(user_id, allowed_users):
         await update.message.reply_text("⛔ Unauthorized.")
         return
-    
-    import paramiko
-    pi_config = config['pi']
-    
+
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            pi_config['host'],
-            port=pi_config.get('port', 22),
-            username=pi_config['user'],
-            password=pi_config.get('password'),
-            key_filename=pi_config.get('key_path')
-        )
-        
-        # Get CPU info
-        _, stdout, _ = ssh.exec_command("uptime | awk -F'load average:' '{print $2}'")
-        load_avg = stdout.read().decode().strip()
-        
-        _, stdout, _ = ssh.exec_command("nproc")
-        cores = stdout.read().decode().strip()
-        
-        # Get CPU usage percentage
-        _, stdout, _ = ssh.exec_command("top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1")
-        cpu_percent = stdout.read().decode().strip()
-        
-        # Get top processes
-        _, stdout, _ = ssh.exec_command("ps aux --sort=-%cpu | head -6 | tail -5 | awk '{printf \"%.1f%% %s\\n\", $3, $11}'")
-        top_processes = stdout.read().decode().strip()
-        
-        result = f"⚙️ *CPU Status*\n\n"
-        result += f"*Load Average:* {load_avg}\n"
-        result += f"*Cores:* {cores}\n"
-        if cpu_percent:
-            result += f"*Usage:* {cpu_percent}%\n\n"
-        result += f"*Top Processes:*\n```{top_processes}```"
-        
-        ssh.close()
+        result = await _run_blocking(_get_cpu_report, config['pi'])
         await update.message.reply_text(result, parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")
@@ -2024,53 +1977,9 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not is_authorized(user_id, allowed_users):
         await update.message.reply_text("⛔ Unauthorized.")
         return
-    
-    import paramiko
-    pi_config = config['pi']
-    
+
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            pi_config['host'],
-            port=pi_config.get('port', 22),
-            username=pi_config['user'],
-            password=pi_config.get('password'),
-            key_filename=pi_config.get('key_path')
-        )
-        
-        # Get memory info
-        _, stdout, _ = ssh.exec_command("free -h | grep '^Mem:'")
-        mem_line = stdout.read().decode().strip()
-        
-        if mem_line:
-            parts = mem_line.split()
-            total = parts[1]
-            used = parts[2]
-            free = parts[3]
-            shared = parts[4]
-            buff_cache = parts[5]
-            available = parts[6]
-            
-            # Calculate percentage
-            _, stdout, _ = ssh.exec_command("free | grep '^Mem:' | awk '{printf \"%.0f\", $3/$2 * 100.0}'")
-            used_percent = stdout.read().decode().strip()
-            
-            # Progress bar
-            filled = int(int(used_percent) / 10)
-            bar = "█" * filled + "░" * (10 - filled)
-            
-            result = f"🧠 *Memory Usage*\n\n"
-            result += f"{bar} {used_percent}%\n\n"
-            result += f"*Total:* {total}\n"
-            result += f"*Used:* {used}\n"
-            result += f"*Free:* {free}\n"
-            result += f"*Available:* {available}\n"
-            result += f"*Cache:* {buff_cache}"
-        else:
-            result = "❌ Could not read memory info"
-        
-        ssh.close()
+        result = await _run_blocking(_get_memory_report, config['pi'])
         await update.message.reply_text(result, parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {type(e).__name__}: {str(e)}")

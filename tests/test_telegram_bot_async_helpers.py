@@ -101,3 +101,165 @@ def test_run_auto_backup_cycle_only_runs_backup_when_due(monkeypatch):
     due, success, message = telegram_bot._run_auto_backup_cycle({'backup': {'enabled': True}})
 
     assert (due, success, message) == (True, True, 'backup ok')
+
+
+def test_get_temperature_report_formats_sensor_output(monkeypatch):
+    class FakeStdout:
+        def read(self):
+            return b'54000'
+
+    class FakeSSH:
+        def exec_command(self, command):
+            return None, FakeStdout(), None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(telegram_bot, '_open_ssh_client', lambda config: FakeSSH())
+
+    result = telegram_bot._get_temperature_report({'host': 'pi'})
+
+    assert '54.0' in result
+    assert 'Normal' in result
+
+
+def test_get_service_status_lines_marks_installed_and_missing_services(monkeypatch):
+    class FakeStdout:
+        def __init__(self, text):
+            self._text = text
+
+        def read(self):
+            return self._text.encode()
+
+    class FakeSSH:
+        def exec_command(self, command):
+            if 'jellyfin' in command:
+                return None, FakeStdout('active'), None
+            if 'qbittorrent-nox' in command:
+                return None, FakeStdout('inactive'), None
+            return None, FakeStdout(''), None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(telegram_bot, '_open_ssh_client', lambda config: FakeSSH())
+
+    result = telegram_bot._get_service_status_lines({'host': 'pi'})
+
+    assert 'Jellyfin: ✅ Running' in result
+    assert 'qBittorrent: ❌ Stopped' in result
+    assert 'Plex: ⚫ Not installed' in result
+
+
+def test_get_memory_report_formats_usage(monkeypatch):
+    outputs = iter([
+        'Mem:           8.0G        2.0G        1.0G        0.1G        5.0G        5.5G',
+        '25',
+    ])
+
+    class FakeStdout:
+        def __init__(self, text):
+            self._text = text
+
+        def read(self):
+            return self._text.encode()
+
+    class FakeSSH:
+        def exec_command(self, command):
+            return None, FakeStdout(next(outputs)), None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(telegram_bot, '_open_ssh_client', lambda config: FakeSSH())
+
+    result = telegram_bot._get_memory_report({'host': 'pi'})
+
+    assert '25%' in result
+    assert '*Total:* 8.0G' in result
+    assert '*Available:* 5.5G' in result
+
+
+def test_reboot_pi_writes_sudo_password(monkeypatch):
+    tracker = {}
+
+    class FakeStdin:
+        def write(self, text):
+            tracker['written'] = text
+
+        def flush(self):
+            tracker['flushed'] = True
+
+    class FakeSSH:
+        def exec_command(self, command, get_pty=True):
+            tracker['command'] = command
+            return FakeStdin(), None, None
+
+        def close(self):
+            tracker['closed'] = True
+
+    monkeypatch.setattr(telegram_bot, '_open_ssh_client', lambda config: FakeSSH())
+
+    telegram_bot._reboot_pi({'host': 'pi', 'sudo_password': 'secret'})
+
+    assert tracker['command'] == 'sudo -S reboot 2>&1'
+    assert tracker['written'] == 'secret\n'
+    assert tracker['flushed'] is True
+    assert tracker['closed'] is True
+
+
+def test_search_downloads_returns_results(monkeypatch):
+    outputs = iter([
+        'ok',
+        '/downloads/Show.Name.S01\n/downloads/Movie.Name.2024.mkv',
+    ])
+
+    class FakeStdout:
+        def __init__(self, text):
+            self._text = text
+
+        def read(self):
+            return self._text.encode()
+
+    class FakeSSH:
+        def exec_command(self, command):
+            return None, FakeStdout(next(outputs)), None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(telegram_bot, '_open_ssh_client', lambda config: FakeSSH())
+
+    path_ok, results, path = telegram_bot._search_downloads({'host': 'pi'}, '/downloads', 'show')
+
+    assert path_ok is True
+    assert path == '/downloads'
+    assert any(line.startswith('🎬') for line in results)
+
+
+def test_run_speed_test_returns_output(monkeypatch):
+    outputs = iter([
+        '/usr/bin/speedtest-cli',
+        'Ping: 20.0 ms\nDownload: 50.0 Mbit/s\nUpload: 10.0 Mbit/s',
+    ])
+
+    class FakeStdout:
+        def __init__(self, text):
+            self._text = text
+
+        def read(self):
+            return self._text.encode()
+
+    class FakeSSH:
+        def exec_command(self, command, timeout=None):
+            return None, FakeStdout(next(outputs)), None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(telegram_bot, '_open_ssh_client', lambda config: FakeSSH())
+
+    success, output = telegram_bot._run_speed_test({'host': 'pi'})
+
+    assert success is True
+    assert 'Download:' in output
