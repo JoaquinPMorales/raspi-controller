@@ -27,6 +27,7 @@ from scanner import FolderScanner
 from copier import RsyncCopier, ExternalCopier
 from jellyfin import refresh_jellyfin_library
 from updater import SystemUpdater
+import async_helpers
 
 # Enable logging
 logging.basicConfig(
@@ -98,6 +99,103 @@ def is_authorized(user_id: int, allowed_users: List[int]) -> bool:
     return not allowed_users or user_id in allowed_users
 
 
+async def _run_blocking(func, *args, **kwargs):
+    """Run blocking work in the default executor."""
+    return await async_helpers.async_call(func, *args, **kwargs)
+
+
+def _scan_download_items(pi_config: dict, downloads_path: str, tmdb_api_key: Optional[str]) -> Optional[List[dict]]:
+    """Scan downloads using a short-lived scanner connection."""
+    scanner = FolderScanner(pi_config, tmdb_api_key=tmdb_api_key)
+    if not scanner.connect():
+        return None
+
+    try:
+        return scanner.scan_folder(downloads_path)
+    finally:
+        scanner.close()
+
+
+def _calculate_selection_stats(pi_config: dict, paths_config: dict, selected: List[dict], mode: str) -> tuple[int, int, str]:
+    """Calculate total selected size and destination free space."""
+    scanner = FolderScanner(pi_config)
+    if not scanner.connect():
+        raise ConnectionError("Failed to connect to Raspberry Pi.")
+
+    try:
+        total_size = scanner.calculate_items_size(selected)
+
+        if mode == 'internal':
+            shows_path = paths_config.get('jellyfin_shows', '/mnt/media/Shows')
+            movies_path = paths_config.get('jellyfin_movies', '/mnt/media/Movies')
+            shows_space = scanner.get_disk_space(shows_path)
+            movies_space = scanner.get_disk_space(movies_path)
+            return total_size, min(shows_space['available'], movies_space['available']), "/mnt/media"
+
+        local_dest = paths_config.get('local_destination', './downloads')
+        local_dest = os.path.abspath(os.path.expanduser(local_dest))
+        try:
+            import shutil
+            stat = shutil.disk_usage(local_dest)
+            dest_free = stat.free
+        except OSError:
+            dest_free = 0
+        return total_size, dest_free, local_dest
+    finally:
+        scanner.close()
+
+
+def _get_disk_space_status(pi_config: dict, paths_config: dict) -> Optional[tuple[dict, dict, dict]]:
+    """Fetch disk space data using a short-lived scanner connection."""
+    scanner = FolderScanner(pi_config)
+    if not scanner.connect():
+        return None
+
+    try:
+        downloads = paths_config['downloads']
+        shows = paths_config.get('jellyfin_shows', '/mnt/media/Shows')
+        movies = paths_config.get('jellyfin_movies', '/mnt/media/Movies')
+        return (
+            scanner.get_disk_space(downloads),
+            scanner.get_disk_space(shows),
+            scanner.get_disk_space(movies),
+        )
+    finally:
+        scanner.close()
+
+
+def _refresh_jellyfin_for_bot(config: dict) -> bool:
+    """Refresh Jellyfin without blocking the bot event loop."""
+    jellyfin_config = config.get('jellyfin', {})
+    host = jellyfin_config.get('host', config['pi']['host'])
+    port = jellyfin_config.get('port', 8096)
+    api_key = jellyfin_config.get('api_key')
+
+    if api_key:
+        return refresh_jellyfin_library(host=host, port=port, api_key=api_key)
+
+    scanner = FolderScanner(config['pi'])
+    if not scanner.connect():
+        return False
+
+    try:
+        return refresh_jellyfin_library(host=host, port=port, api_key=api_key, scanner=scanner)
+    finally:
+        scanner.close()
+
+
+def _run_auto_backup_cycle(config: dict) -> tuple[bool, bool, str]:
+    """Run a single auto-backup check and backup cycle."""
+    from backup import SystemBackup
+
+    backup = SystemBackup(config)
+    if not backup.needs_backup():
+        return False, False, ""
+
+    success, message = backup.create_backup()
+    return True, success, message
+
+
 # Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the bot and check authorization."""
@@ -155,25 +253,20 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     config = user_data[user_id]['config']
     tmdb_key = config.get('tmdb', {}).get('api_key')
-    scanner = FolderScanner(config['pi'], tmdb_api_key=tmdb_key)
-    
-    if not scanner.connect():
+    downloads_path = config['paths']['downloads']
+    items = await _run_blocking(_scan_download_items, config['pi'], downloads_path, tmdb_key)
+
+    if items is None:
         await query.edit_message_text(
             "❌ Failed to connect to Raspberry Pi.\n"
             "Check your configuration."
         )
         return ConversationHandler.END
-    
-    user_data[user_id]['scanner'] = scanner
-    
-    downloads_path = config['paths']['downloads']
-    items = scanner.scan_folder(downloads_path)
-    
+
     if not items:
         await query.edit_message_text(
             "📂 No items found in downloads folder."
         )
-        scanner.close()
         return ConversationHandler.END
     
     # Organize items
@@ -320,7 +413,6 @@ async def confirm_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     available_items = user_data[user_id]['available_items']
     mode = user_data[user_id]['mode']
     config = user_data[user_id]['config']
-    scanner = user_data[user_id]['scanner']
     
     if not selected_indices:
         await query.answer("No items selected!", show_alert=True)
@@ -329,28 +421,18 @@ async def confirm_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # Get selected items
     selected = [available_items[i] for i in selected_indices]
     user_data[user_id]['selected'] = selected
-    
-    # Calculate sizes
-    total_size = scanner.calculate_items_size(selected)
-    
-    # Get destination space
-    if mode == 'internal':
-        shows_path = config['paths'].get('jellyfin_shows', '/mnt/media/Shows')
-        movies_path = config['paths'].get('jellyfin_movies', '/mnt/media/Movies')
-        shows_space = scanner.get_disk_space(shows_path)
-        movies_space = scanner.get_disk_space(movies_path)
-        dest_free = min(shows_space['available'], movies_space['available'])
-        dest_path = "/mnt/media"
-    else:
-        local_dest = config['paths'].get('local_destination', './downloads')
-        local_dest = os.path.abspath(os.path.expanduser(local_dest))
-        try:
-            import shutil
-            stat = shutil.disk_usage(local_dest)
-            dest_free = stat.free
-        except Exception:
-            dest_free = 0
-        dest_path = local_dest
+
+    try:
+        total_size, dest_free, dest_path = await _run_blocking(
+            _calculate_selection_stats,
+            config['pi'],
+            config['paths'],
+            selected,
+            mode,
+        )
+    except ConnectionError:
+        await query.edit_message_text("❌ Failed to connect to Raspberry Pi.")
+        return ConversationHandler.END
     
     # Build summary
     tv_count = sum(1 for s in selected if s['content_type'] == 'tv')
@@ -423,7 +505,6 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """Run the actual copy process and send progress updates."""
     query = update.callback_query
     user_id = update.effective_user.id
-    scanner = user_data[user_id]['scanner']
     
     # Get dry-run mode for this user
     dry_run = user_data[user_id].get('dry_run', config.get('options', {}).get('dry_run', False))
@@ -443,7 +524,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         'ep_total': 0,
     }
     total_items = len(selected)
-    _event_loop = asyncio.get_event_loop()
+    _event_loop = asyncio.get_running_loop()
     
     async def update_progress_message():
         """Update the Telegram message with current progress."""
@@ -615,15 +696,9 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
             if mode == 'internal' and not dry_run:
                 result_text += "\n🔄 Refreshing Jellyfin library..."
                 await query.message.edit_text(result_text)
-                
-                jellyfin_config = config.get('jellyfin', {})
-                refresh_success = refresh_jellyfin_library(
-                    host=jellyfin_config.get('host', config['pi']['host']),
-                    port=jellyfin_config.get('port', 8096),
-                    api_key=jellyfin_config.get('api_key'),
-                    scanner=scanner
-                )
-                
+
+                refresh_success = await _run_blocking(_refresh_jellyfin_for_bot, config)
+
                 if refresh_success:
                     result_text += "\n✅ Jellyfin refreshed!"
                 else:
@@ -641,7 +716,6 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
             parse_mode='Markdown'
         )
     finally:
-        scanner.close()
         # Clean up user data
         if user_id in user_data:
             del user_data[user_id]
@@ -709,25 +783,34 @@ async def run_update_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
     query = update.callback_query
     user_id = update.effective_user.id
     updater = SystemUpdater(config['pi'])
+    event_loop = asyncio.get_running_loop()
     
     class TelegramConsole:
-        def __init__(self, message):
+        def __init__(self, message, loop):
             self.message = message
+            self._loop = loop
+            self._updates = []
+
+        async def _push_update(self, clean_text: str):
+            self._updates.append(clean_text)
+            lines = ["🔧 Starting system updates..."]
+            lines.extend(self._updates[-12:])
+            try:
+                await self.message.edit_text('\n'.join(lines))
+            except Exception as exc:
+                logger.warning("Failed to update maintenance progress message: %s", exc)
         
         def print(self, text):
             import re
             clean_text = re.sub(r'\[/?[^\]]+\]', '', text)
             if any(keyword in clean_text.lower() for keyword in ['completed', 'error', 'failed', 'success', '✓']):
-                asyncio.create_task(
-                    self.message.edit_text(
-                        f"{self.message.text}\n{clean_text}"
-                    )
-                )
+                logger.info("[updater] %s", clean_text)
+                asyncio.run_coroutine_threadsafe(self._push_update(clean_text), self._loop)
     
-    console = TelegramConsole(query.message)
+    console = TelegramConsole(query.message, event_loop)
     
     try:
-        success = updater.perform_updates(console, dry_run=False)
+        success = await _run_blocking(updater.perform_updates, console, False)
         
         if success:
             await query.message.edit_text(
@@ -2026,7 +2109,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pass  # Ignore edit errors
     
     # Run backup in executor to not block
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     success, result_msg = await loop.run_in_executor(
         None, 
         lambda: backup.create_backup(lambda msg: asyncio.run_coroutine_threadsafe(progress_callback(msg), loop))
@@ -2128,32 +2211,20 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     
     await update.message.reply_text("🔍 Checking disk space...")
-    
-    from scanner import FolderScanner
-    scanner = FolderScanner(config['pi'])
-    
-    if not scanner.connect():
+
+    space_info = await _run_blocking(_get_disk_space_status, config['pi'], config['paths'])
+    if space_info is None:
         await update.message.reply_text("❌ Failed to connect to Pi.")
         return
-    
-    try:
-        downloads = config['paths']['downloads']
-        shows = config['paths'].get('jellyfin_shows', '/mnt/media/Shows')
-        movies = config['paths'].get('jellyfin_movies', '/mnt/media/Movies')
-        
-        dl_space = scanner.get_disk_space(downloads)
-        shows_space = scanner.get_disk_space(shows)
-        movies_space = scanner.get_disk_space(movies)
-        
-        status_text = (
-            "📊 *Disk Space Status*\n\n"
-            f"*Downloads:* {format_size(dl_space['available'])} free\n"
-            f"*Shows:* {format_size(shows_space['available'])} free\n"
-            f"*Movies:* {format_size(movies_space['available'])} free"
-        )
-        await update.message.reply_text(status_text, parse_mode='Markdown')
-    finally:
-        scanner.close()
+
+    dl_space, shows_space, movies_space = space_info
+    status_text = (
+        "📊 *Disk Space Status*\n\n"
+        f"*Downloads:* {format_size(dl_space['available'])} free\n"
+        f"*Shows:* {format_size(shows_space['available'])} free\n"
+        f"*Movies:* {format_size(movies_space['available'])} free"
+    )
+    await update.message.reply_text(status_text, parse_mode='Markdown')
 
 
 def main():
@@ -2207,14 +2278,11 @@ def main():
         if backup_config.get('enabled', False) and backup_config.get('auto_backup', True):
             async def auto_backup_scheduler():
                 """Run monthly backup check in background."""
-                from backup import SystemBackup
-                
                 while True:
                     try:
-                        backup = SystemBackup(config)
-                        if backup.needs_backup():
+                        due, success, msg = await _run_blocking(_run_auto_backup_cycle, config)
+                        if due:
                             logger.info("Monthly backup is due, starting auto-backup...")
-                            success, msg = backup.create_backup()
                             if success:
                                 logger.info(f"Auto-backup completed: {msg}")
                                 # Notify all users with notifications enabled
