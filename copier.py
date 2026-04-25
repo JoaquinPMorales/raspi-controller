@@ -7,15 +7,13 @@ import re
 import shlex
 import shutil
 import subprocess
-import threading
-import time
 from pathlib import Path
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional
 from dataclasses import dataclass
 
 import paramiko
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn, TaskID
 
 
 def _resolve_rsync_bin() -> str:
@@ -67,6 +65,14 @@ class RsyncCopier:
     def cancel(self):
         """Signal cancellation of ongoing operations."""
         self.cancelled = True
+
+    def _require_destination_base(self, *keys: str) -> str:
+        """Return the first configured destination base path or raise a clear error."""
+        for key in keys:
+            value = self.paths_config.get(key)
+            if value:
+                return value
+        raise ValueError(f"Missing destination path configuration; expected one of: {', '.join(keys)}")
     
     def _build_rsync_args(self, source: str, destination: str, source_is_dir: bool = True) -> list:
         """Build rsync argument list (no shell quoting needed)."""
@@ -161,7 +167,7 @@ class RsyncCopier:
         season = item.get('season')
         
         if content_type == 'tv':
-            dest_base = self.paths_config.get('jellyfin_shows') or self.paths_config.get('jellyfin_tv')
+            dest_base = self._require_destination_base('jellyfin_shows', 'jellyfin_tv')
             # Check for existing series folder first
             existing_folder = self._find_existing_series_folder(dest_base, show_name)
             if existing_folder:
@@ -174,7 +180,7 @@ class RsyncCopier:
             else:
                 return f"{dest_base}/{folder_name}"
         else:
-            dest_base = self.paths_config.get('jellyfin_movies')
+            dest_base = self._require_destination_base('jellyfin_movies')
             # Jellyfin: Movie Name (year)/
             folder_name = f"{show_name} ({year})" if year else show_name
             return f"{dest_base}/{folder_name}"
@@ -195,7 +201,7 @@ class RsyncCopier:
         except Exception:
             return 0
 
-    def _rsync_local(self, source: str, dest: str, console, progress, task_id, 
+    def _rsync_local(self, source: str, dest: str, console, progress, task_id: TaskID, 
                      display_name: str, progress_callback=None, source_is_dir: bool = True,
                      item_num: int = 1, total_items: int = 1) -> bool:
         """Run rsync locally using subprocess (much faster than SSH for local copies)."""
@@ -220,6 +226,11 @@ class RsyncCopier:
                 text=True,
                 bufsize=1  # Line buffered
             )
+            stdout = process.stdout
+            stderr = process.stderr
+            if stdout is None or stderr is None:
+                process.terminate()
+                raise RuntimeError("rsync process did not expose stdout/stderr pipes")
             
             current_file = ""
             
@@ -233,7 +244,7 @@ class RsyncCopier:
                     process.terminate()
                     return False
                 
-                line = process.stdout.readline()
+                line = stdout.readline()
                 if not line:
                     break
                 
@@ -260,7 +271,7 @@ class RsyncCopier:
             
             # Wait for completion
             exit_status = process.wait()
-            stderr_output = process.stderr.read()
+            stderr_output = stderr.read()
             
             if exit_status == 0:
                 progress.update(task_id, completed=100)
@@ -273,7 +284,7 @@ class RsyncCopier:
             console.print(f"[red]Error during rsync: {e}[/red]")
             return False
     
-    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int, 
+    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: TaskID, 
                            progress_callback=None, item_num: int = 1, total_items: int = 1) -> bool:
         """
         Copy a single item (TV season or movie) to Jellyfin with progress monitoring.
@@ -358,7 +369,7 @@ class RsyncCopier:
             
             console.print(f"[dim]Executing: {rsync_cmd}[/dim]")
             
-            stdin, stdout, stderr = ssh.exec_command(rsync_cmd)
+            _, stdout, stderr = ssh.exec_command(rsync_cmd)
             
             current_file = ""
             
@@ -631,7 +642,7 @@ class ExternalCopier:
         dest_path: str,
         console: Console,
         progress: Progress,
-        task_id: int,
+        task_id: TaskID,
         display_name: str,
         progress_callback=None,
         source_is_dir: bool = True,
@@ -651,6 +662,11 @@ class ExternalCopier:
                 env=env,
             )
             self.active_process = process
+            stdout = process.stdout
+            stderr = process.stderr
+            if stdout is None or stderr is None:
+                process.terminate()
+                raise RuntimeError("rsync process did not expose stdout/stderr pipes")
             current_file = ""
 
             if progress_callback:
@@ -661,7 +677,7 @@ class ExternalCopier:
                     process.terminate()
                     return False
 
-                line = process.stdout.readline()
+                line = stdout.readline()
                 if not line:
                     break
 
@@ -680,7 +696,7 @@ class ExternalCopier:
                         progress_callback(percent, current_file, progress_info['speed'], progress_info['eta'])
 
             exit_status = process.wait()
-            stderr_output = process.stderr.read().strip()
+            stderr_output = stderr.read().strip()
 
             if self.cancelled:
                 return False
@@ -701,7 +717,7 @@ class ExternalCopier:
         finally:
             self.active_process = None
     
-    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: int, progress_callback=None) -> bool:
+    def _copy_single_item(self, item: Dict, console: Console, progress: Progress, task_id: TaskID, progress_callback=None) -> bool:
         """Copy a single item from Pi to local laptop."""
         source_path = item['path']
         dest_path = self._get_local_destination(item)

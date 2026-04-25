@@ -34,7 +34,7 @@ Both support two operation modes:
 1. **Clone or download this repository:**
 ```bash
 git clone <repository-url>
-cd jellyfin-copy
+cd raspi-controller
 ```
 
 2. **Create a virtual environment and install dependencies:**

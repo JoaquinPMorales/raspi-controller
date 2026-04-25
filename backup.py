@@ -7,16 +7,20 @@ import os
 import subprocess
 import json
 import logging
+import shlex
+import shutil
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 try:
     from alerts import notify_config
-except Exception:
+except ImportError:
     def notify_config(cfg, text):
         return False, "alerts not available"
+
+
+DEFAULT_STATUS = {'last_backup': None, 'last_success': None, 'cloud_sync': False}
 
 
 class SystemBackup:
@@ -31,7 +35,49 @@ class SystemBackup:
         self.cloud_remote = self.backup_config.get('cloud_remote', 'gdrive:Backups')
         self.keep_local = self.backup_config.get('keep_local', True)
         self.status_file = os.path.join(self.local_path, '.backup_status.json')
-        
+
+    def _default_status(self) -> Dict[str, Any]:
+        """Return a fresh default backup status payload."""
+        return dict(DEFAULT_STATUS)
+
+    def _notify(self, text: str) -> None:
+        """Send a best-effort alert and log delivery failures."""
+        ok, message = notify_config(self.config, text)
+        if not ok:
+            logger.warning("Backup alert not sent: %s", message)
+
+    def _cleanup_file(self, path: str) -> None:
+        """Remove a partially created file and log cleanup failures."""
+        if not os.path.exists(path):
+            return
+        try:
+            os.remove(path)
+        except OSError as exc:
+            logger.warning("Failed to remove file %s: %s", path, exc)
+
+    def _remove_previous_backup(self, path: str) -> None:
+        """Delete an older local backup and its cloud copy when enabled."""
+        try:
+            os.remove(path)
+        except OSError as exc:
+            logger.warning("Failed to remove old backup %s: %s", path, exc)
+            return
+
+        if self.cloud_enabled:
+            self.remove_from_cloud(os.path.basename(path))
+
+    def _parse_last_backup(self, status: Dict[str, Any]) -> Optional[datetime]:
+        """Parse the last-backup timestamp and log malformed values."""
+        last_backup = status.get('last_backup')
+        if not last_backup:
+            return None
+
+        try:
+            return datetime.fromisoformat(last_backup)
+        except ValueError:
+            logger.warning("Invalid last_backup timestamp in %s: %r", self.status_file, last_backup)
+            return None
+    
     def get_backup_filename(self) -> str:
         """Generate backup filename with timestamp."""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -60,9 +106,9 @@ class SystemBackup:
             try:
                 with open(self.status_file, 'r') as f:
                     return json.load(f)
-            except Exception:
-                pass
-        return {'last_backup': None, 'last_success': None, 'cloud_sync': False}
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Failed to load backup status from %s: %s", self.status_file, exc)
+        return self._default_status()
     
     def save_status(self, status: Dict):
         """Save backup status to JSON file."""
@@ -73,10 +119,9 @@ class SystemBackup:
     def needs_backup(self) -> bool:
         """Check if a monthly backup is due."""
         status = self.load_status()
-        if not status['last_backup']:
+        last = self._parse_last_backup(status)
+        if last is None:
             return True
-        
-        last = datetime.fromisoformat(status['last_backup'])
         next_due = last + timedelta(days=30)
         return datetime.now() >= next_due
     
@@ -109,7 +154,10 @@ class SystemBackup:
         old_backup = self.get_latest_backup()
 
         try:
-            cmd = f"sudo dd if={self.source_device} bs=4M status=progress | gzip > {backup_file}"
+            cmd = (
+                f"sudo dd if={shlex.quote(self.source_device)} bs=4M status=progress "
+                f"| gzip > {shlex.quote(backup_file)}"
+            )
             if progress_callback:
                 progress_callback("Starting full-image backup (dd + gzip)...")
 
@@ -123,12 +171,8 @@ class SystemBackup:
             )
 
             if result.returncode != 0:
-                if os.path.exists(backup_file):
-                    os.remove(backup_file)
-                try:
-                    notify_config(self.config, f"Backup failed: {result.stderr}")
-                except Exception:
-                    pass
+                self._cleanup_file(backup_file)
+                self._notify(f"Backup failed: {result.stderr}")
                 return False, f"Backup failed: {result.stderr}"
 
             size = os.path.getsize(backup_file)
@@ -148,12 +192,7 @@ class SystemBackup:
             if old_backup and old_backup != backup_file:
                 if progress_callback:
                     progress_callback("Removing old backup...")
-                try:
-                    os.remove(old_backup)
-                    if self.cloud_enabled:
-                        self.remove_from_cloud(os.path.basename(old_backup))
-                except Exception as e:
-                    logger.warning(f"Failed to remove old backup: {e}")
+                self._remove_previous_backup(old_backup)
 
             status = self.load_status()
             status['last_backup'] = datetime.now().isoformat()
@@ -163,20 +202,15 @@ class SystemBackup:
             status['cloud_sync'] = self.cloud_enabled
             self.save_status(status)
 
-            try:
-                notify_config(self.config, f"Backup completed: {os.path.basename(backup_file)} ({size_mb:.1f} MB)")
-            except Exception:
-                pass
+            self._notify(f"Backup completed: {os.path.basename(backup_file)} ({size_mb:.1f} MB)")
 
             return True, f"Backup completed: {os.path.basename(backup_file)} ({size_mb:.1f} MB)"
 
         except subprocess.TimeoutExpired:
-            if os.path.exists(backup_file):
-                os.remove(backup_file)
+            self._cleanup_file(backup_file)
             return False, "Backup timed out after 2 hours"
-        except Exception as e:
-            if os.path.exists(backup_file):
-                os.remove(backup_file)
+        except OSError as e:
+            self._cleanup_file(backup_file)
             return False, f"Backup error: {str(e)}"
 
     def _create_rsync_snapshot(self, progress_callback=None) -> tuple[bool, str]:
@@ -204,7 +238,8 @@ class SystemBackup:
             entries.sort(reverse=True)
             if entries:
                 latest = os.path.join(snapshots_root, entries[0])
-        except Exception:
+        except OSError as exc:
+            logger.warning("Failed to inspect snapshots in %s: %s", snapshots_root, exc)
             latest = None
 
         rsync_cmd = ['rsync', '-a', '--delete']
@@ -218,10 +253,7 @@ class SystemBackup:
 
             result = subprocess.run(rsync_cmd, capture_output=True, text=True, timeout=7200)
             if result.returncode != 0:
-                try:
-                    notify_config(self.config, f"rsync failed: {result.stderr}")
-                except Exception:
-                    pass
+                self._notify(f"rsync failed: {result.stderr}")
                 return False, f"rsync failed: {result.stderr}"
 
             # Tar the snapshot for upload
@@ -231,10 +263,8 @@ class SystemBackup:
                 progress_callback("Archiving snapshot...")
             result = subprocess.run(tar_cmd, capture_output=True, text=True, timeout=3600)
             if result.returncode != 0:
-                try:
-                    notify_config(self.config, f"tar failed: {result.stderr}")
-                except Exception:
-                    pass
+                self._cleanup_file(backup_file)
+                self._notify(f"tar failed: {result.stderr}")
                 return False, f"tar failed: {result.stderr}"
 
             size = os.path.getsize(backup_file)
@@ -249,12 +279,7 @@ class SystemBackup:
             # Clean up old tar backup files
             old_backup = self.get_latest_backup()
             if old_backup and os.path.basename(old_backup) != os.path.basename(backup_file):
-                try:
-                    os.remove(old_backup)
-                    if self.cloud_enabled:
-                        self.remove_from_cloud(os.path.basename(old_backup))
-                except Exception:
-                    pass
+                self._remove_previous_backup(old_backup)
 
             status = self.load_status()
             status['last_backup'] = datetime.now().isoformat()
@@ -264,16 +289,15 @@ class SystemBackup:
             status['cloud_sync'] = self.cloud_enabled
             self.save_status(status)
 
-            try:
-                notify_config(self.config, f"Snapshot completed: {os.path.basename(backup_file)} ({size/1024/1024:.1f} MB)")
-            except Exception:
-                pass
+            self._notify(f"Snapshot completed: {os.path.basename(backup_file)} ({size/1024/1024:.1f} MB)")
 
             return True, f"Snapshot completed: {os.path.basename(backup_file)} ({size/1024/1024:.1f} MB)"
 
         except subprocess.TimeoutExpired:
+            self._cleanup_file(os.path.join(self.local_path, f"raspi-backup-{timestamp}-rsync.tar.gz"))
             return False, "rsync/tar timed out"
-        except Exception as e:
+        except OSError as e:
+            self._cleanup_file(os.path.join(self.local_path, f"raspi-backup-{timestamp}-rsync.tar.gz"))
             return False, f"Snapshot error: {e}"
 
     def _create_restic_snapshot(self, progress_callback=None) -> tuple[bool, str]:
@@ -293,10 +317,7 @@ class SystemBackup:
             cmd = ['restic', '-r', restic_repo, 'backup', source_path]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
             if result.returncode != 0:
-                try:
-                    notify_config(self.config, f"restic failed: {result.stderr}")
-                except Exception:
-                    pass
+                self._notify(f"restic failed: {result.stderr}")
                 return False, f"restic failed: {result.stderr}"
 
             status = self.load_status()
@@ -307,15 +328,12 @@ class SystemBackup:
             status['cloud_sync'] = True
             self.save_status(status)
 
-            try:
-                notify_config(self.config, f"Restic backup completed for {source_path}")
-            except Exception:
-                pass
+            self._notify(f"Restic backup completed for {source_path}")
 
             return True, "Restic backup completed"
         except subprocess.TimeoutExpired:
             return False, "restic timed out"
-        except Exception as e:
+        except OSError as e:
             return False, f"restic error: {e}"
     
     def upload_to_cloud(self, local_file: str, progress_callback=None) -> tuple[bool, str]:
@@ -324,9 +342,7 @@ class SystemBackup:
         Returns (success, message)
         """
         try:
-            # Check if rclone is installed
-            result = subprocess.run(['which', 'rclone'], capture_output=True)
-            if result.returncode != 0:
+            if not shutil.which('rclone'):
                 return False, "rclone not installed. Run: sudo apt install rclone"
             
             filename = os.path.basename(local_file)
@@ -336,7 +352,7 @@ class SystemBackup:
                 progress_callback(f"Uploading {filename} to cloud...")
             
             # Use rclone to copy with progress
-            cmd = ['rclone', 'copy', local_file, remote_path.replace(filename, ''), '--progress', '--transfers', '1']
+            cmd = ['rclone', 'copy', local_file, self.cloud_remote, '--progress', '--transfers', '1']
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
             
             if result.returncode != 0:
@@ -346,29 +362,37 @@ class SystemBackup:
             
         except subprocess.TimeoutExpired:
             return False, "Cloud upload timed out after 1 hour"
-        except Exception as e:
+        except OSError as e:
             return False, f"Upload error: {str(e)}"
     
     def remove_from_cloud(self, filename: str):
         """Remove a file from cloud storage."""
         try:
+            if not shutil.which('rclone'):
+                logger.warning("Cannot remove %s from cloud because rclone is not installed", filename)
+                return
             remote_path = f"{self.cloud_remote}/{filename}"
-            subprocess.run(
+            result = subprocess.run(
                 ['rclone', 'delete', remote_path],
                 capture_output=True,
+                text=True,
                 timeout=300
             )
-        except Exception as e:
+            if result.returncode != 0:
+                logger.warning("Failed to remove %s from cloud: %s", filename, result.stderr.strip() or f"exit {result.returncode}")
+        except (OSError, subprocess.TimeoutExpired) as e:
             logger.warning(f"Failed to remove from cloud: {e}")
     
     def get_status_text(self) -> str:
         """Get human-readable backup status."""
         status = self.load_status()
-        
-        if not status['last_backup']:
+        last = self._parse_last_backup(status)
+
+        if last is None:
+            if status.get('last_backup'):
+                return "⚠️ Backup status file is invalid. Run a new backup to refresh it."
             return "⚠️ No backup has been created yet"
-        
-        last = datetime.fromisoformat(status['last_backup'])
+
         next_due = last + timedelta(days=30)
         days_until = (next_due - datetime.now()).days
         
