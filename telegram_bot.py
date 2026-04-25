@@ -27,7 +27,7 @@ from telegram.ext import (
 
 from scanner import FolderScanner
 from copier import RsyncCopier, ExternalCopier
-from jellyfin import refresh_jellyfin_library
+from jellyfin import refresh_jellyfin_library, async_refresh_jellyfin_library
 from updater import SystemUpdater
 import async_helpers
 
@@ -184,6 +184,19 @@ def _refresh_jellyfin_for_bot(config: dict) -> bool:
         return refresh_jellyfin_library(host=host, port=port, api_key=api_key, scanner=scanner)
     finally:
         scanner.close()
+
+
+async def _refresh_jellyfin_for_bot_async(config: dict) -> bool:
+    """Refresh Jellyfin while staying async for the API-key path."""
+    jellyfin_config = config.get('jellyfin', {})
+    host = jellyfin_config.get('host', config['pi']['host'])
+    port = jellyfin_config.get('port', 8096)
+    api_key = jellyfin_config.get('api_key')
+
+    if api_key:
+        return await async_refresh_jellyfin_library(host=host, port=port, api_key=api_key)
+
+    return await _run_blocking(_refresh_jellyfin_for_bot, config)
 
 
 def _run_auto_backup_cycle(config: dict) -> tuple[bool, bool, str]:
@@ -465,7 +478,17 @@ def _run_speed_test(pi_config: dict) -> tuple[bool, str]:
         check = stdout.read().decode().strip()
 
         if 'not_installed' in check:
-            ssh.exec_command('sudo apt update && sudo apt install -y speedtest-cli')
+            sudo_password = pi_config.get('sudo_password', '')
+            if not sudo_password:
+                return False, ""
+            stdin, install_stdout, _ = ssh.exec_command(
+                'sudo -S sh -c "apt update && apt install -y speedtest-cli"',
+                get_pty=True,
+            )
+            stdin.write(sudo_password + '\n')
+            stdin.flush()
+            if install_stdout.channel.recv_exit_status() != 0:
+                return False, ""
 
         _, stdout, _ = ssh.exec_command('speedtest-cli --simple', timeout=90)
         output = stdout.read().decode().strip()
@@ -1022,7 +1045,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 result_text += "\n🔄 Refreshing Jellyfin library..."
                 await query.message.edit_text(result_text)
 
-                refresh_success = await _run_blocking(_refresh_jellyfin_for_bot, config)
+                refresh_success = await _refresh_jellyfin_for_bot_async(config)
 
                 if refresh_success:
                     result_text += "\n✅ Jellyfin refreshed!"
@@ -1924,7 +1947,7 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await progress_msg.edit_text('\n'.join(lines), parse_mode='Markdown')
     
     try:
-        refresh_success = await _run_blocking(_refresh_jellyfin_for_bot, config)
+        refresh_success = await _refresh_jellyfin_for_bot_async(config)
         if refresh_success:
             await update.message.reply_text("✅ Jellyfin refreshed successfully!")
         else:

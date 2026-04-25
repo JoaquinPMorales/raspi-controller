@@ -51,7 +51,10 @@ def _paramiko_exec_sync(ssh, command: str) -> Tuple[int, str, str]:
 async def async_paramiko_exec(ssh, command: str, timeout: int = None) -> Tuple[int, str, str]:
     """Run a paramiko exec_command in a thread and return (exit_status, stdout, stderr)."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, functools.partial(_paramiko_exec_sync, ssh, command))
+    future = loop.run_in_executor(None, functools.partial(_paramiko_exec_sync, ssh, command))
+    if timeout is None:
+        return await future
+    return await asyncio.wait_for(future, timeout=timeout)
 
 
 __all__ = ["async_run_cmd", "async_call", "async_paramiko_exec"]

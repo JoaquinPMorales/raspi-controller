@@ -2,6 +2,7 @@ import pytest
 import sys
 import os
 import subprocess
+import asyncio
 
 # Ensure project root is on sys.path so tests can import project modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -59,6 +60,22 @@ async def test_async_paramiko_exec_exception():
 
     with pytest.raises(RuntimeError):
         await async_paramiko_exec(BadSSH(), 'bad')
+
+
+@pytest.mark.asyncio
+async def test_async_paramiko_exec_timeout():
+    class SlowSSH:
+        def exec_command(self, command, get_pty=True):
+            class SlowStdout(FakeStdout):
+                def read(self):
+                    import time
+                    time.sleep(0.05)
+                    return super().read()
+
+            return None, SlowStdout(b'hello', rc=0), FakeStderr(b'')
+
+    with pytest.raises(asyncio.TimeoutError):
+        await async_paramiko_exec(SlowSSH(), 'ls -la', timeout=0.001)
 
 
 @pytest.mark.asyncio

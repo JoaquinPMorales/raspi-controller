@@ -263,3 +263,48 @@ def test_run_speed_test_returns_output(monkeypatch):
 
     assert success is True
     assert 'Download:' in output
+
+
+def test_run_speed_test_installs_with_sudo_password(monkeypatch):
+    tracker = {}
+
+    class FakeChannel:
+        def recv_exit_status(self):
+            return 0
+
+    class FakeStdout:
+        def __init__(self, text, with_channel=False):
+            self._text = text
+            self.channel = FakeChannel() if with_channel else None
+
+        def read(self):
+            return self._text.encode()
+
+    class FakeStdin:
+        def write(self, text):
+            tracker['written'] = text
+
+        def flush(self):
+            tracker['flushed'] = True
+
+    class FakeSSH:
+        def exec_command(self, command, timeout=None, get_pty=False):
+            tracker.setdefault('commands', []).append(command)
+            if 'which speedtest-cli' in command:
+                return None, FakeStdout('not_installed'), None
+            if 'apt install -y speedtest-cli' in command:
+                return FakeStdin(), FakeStdout('', with_channel=True), None
+            return None, FakeStdout('Ping: 1 ms\nDownload: 2 Mbit/s\nUpload: 3 Mbit/s'), None
+
+        def close(self):
+            tracker['closed'] = True
+
+    monkeypatch.setattr(telegram_bot, '_open_ssh_client', lambda config: FakeSSH())
+
+    success, output = telegram_bot._run_speed_test({'host': 'pi', 'sudo_password': 'secret'})
+
+    assert success is True
+    assert tracker['written'] == 'secret\n'
+    assert tracker['flushed'] is True
+    assert any('apt install -y speedtest-cli' in command for command in tracker['commands'])
+    assert 'Upload:' in output

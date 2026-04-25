@@ -2,8 +2,10 @@
 Jellyfin API module for refreshing the media library.
 """
 
-import json
+import asyncio
 from typing import Optional
+
+import httpx
 
 
 def refresh_jellyfin_library(host: str, port: int, api_key: Optional[str], scanner=None) -> bool:
@@ -50,6 +52,30 @@ def refresh_jellyfin_library(host: str, port: int, api_key: Optional[str], scann
         return False
 
 
+async def async_refresh_jellyfin_library(host: str, port: int, api_key: Optional[str], scanner=None) -> bool:
+    """Trigger a Jellyfin refresh without blocking the event loop."""
+    if not api_key and scanner:
+        return await asyncio.to_thread(_refresh_via_ssh, scanner, host, port)
+
+    if not api_key:
+        return False
+
+    try:
+        url = f"http://{host}:{port}/Library/Refresh"
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "X-Emby-Token": api_key,
+                    "Content-Type": "application/json",
+                },
+            )
+        return response.status_code in (200, 204)
+    except Exception as e:
+        print(f"Jellyfin API refresh failed: {e}")
+        return False
+
+
 def _refresh_via_ssh(scanner, host: str, port: int) -> bool:
     """
     Try to refresh Jellyfin library using system commands via SSH.
@@ -78,3 +104,6 @@ def _refresh_via_ssh(scanner, host: str, port: int) -> bool:
     except Exception as e:
         print(f"SSH-based refresh failed: {e}")
         return False
+
+
+__all__ = ["refresh_jellyfin_library", "async_refresh_jellyfin_library"]
