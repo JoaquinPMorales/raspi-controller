@@ -1,5 +1,8 @@
+import asyncio
 import os
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -308,3 +311,186 @@ def test_run_speed_test_installs_with_sudo_password(monkeypatch):
     assert tracker['flushed'] is True
     assert any('apt install -y speedtest-cli' in command for command in tracker['commands'])
     assert 'Upload:' in output
+
+
+@pytest.mark.asyncio
+async def test_long_running_operation_gate_rejects_second_operation():
+    assert await telegram_bot._begin_long_running_operation("user:1", "copy") is True
+    try:
+        assert telegram_bot._long_running_operation_busy_text() == (
+            "⚠️ Another copy operation is already running. Please wait for it to finish."
+        )
+        assert await telegram_bot._begin_long_running_operation("user:2", "backup") is False
+    finally:
+        telegram_bot._finish_long_running_operation("user:1")
+
+
+@pytest.mark.asyncio
+async def test_cancel_requests_active_operation(monkeypatch):
+    class FakeOperation:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class FakeQuery:
+        def __init__(self):
+            self.texts = []
+            self.message = None
+
+        async def answer(self):
+            return None
+
+        async def edit_message_text(self, text):
+            self.texts.append(text)
+
+    class FakeUser:
+        id = 7
+
+    class FakeUpdate:
+        effective_user = FakeUser()
+
+        def __init__(self, query):
+            self.callback_query = query
+            self.message = None
+
+    query = FakeQuery()
+    update = FakeUpdate(query)
+    context = object()
+    telegram_bot.user_data[7] = {}
+
+    operation = FakeOperation()
+    assert await telegram_bot._begin_long_running_operation("user:7", "copy") is True
+    telegram_bot._set_long_running_operation_resource("user:7", operation)
+
+    try:
+        result = await telegram_bot.cancel(update, context)
+        assert result == telegram_bot.ConversationHandler.END
+        assert operation.cancelled is True
+        assert query.texts[-1] == "❌ Cancellation requested. Stopping the active operation..."
+    finally:
+        telegram_bot._finish_long_running_operation("user:7")
+
+
+@pytest.mark.asyncio
+async def test_run_copy_process_uses_run_blocking(monkeypatch):
+    tracker = {}
+
+    class FakeMessage:
+        def __init__(self):
+            self.texts = []
+
+        async def edit_text(self, text, parse_mode=None):
+            self.texts.append((text, parse_mode))
+
+    class FakeQuery:
+        def __init__(self):
+            self.message = FakeMessage()
+
+    class FakeUser:
+        id = 11
+
+    class FakeUpdate:
+        effective_user = FakeUser()
+        callback_query = FakeQuery()
+
+    class FakeCopier:
+        def __init__(self, pi_config, paths_config, options_config):
+            tracker['copier_init'] = (pi_config, paths_config, options_config)
+
+        def cancel(self):
+            tracker['cancel_called'] = True
+
+        def copy_items(self, selected, console, progress_callback=None):
+            tracker['copy_items_called'] = True
+            tracker['selected'] = selected
+            return True
+
+    async def fake_run_blocking(func, *args, **kwargs):
+        tracker['run_blocking_used'] = True
+        return func()
+
+    monkeypatch.setattr(telegram_bot, 'RsyncCopier', FakeCopier)
+    monkeypatch.setattr(telegram_bot, '_run_blocking', fake_run_blocking)
+    monkeypatch.setattr(telegram_bot, '_refresh_jellyfin_for_bot_async', lambda config: asyncio.sleep(0, result=True))
+
+    telegram_bot.user_data[11] = {'dry_run': False}
+    assert await telegram_bot._begin_long_running_operation("user:11", "copy") is True
+
+    try:
+        await telegram_bot.run_copy_process(
+            FakeUpdate(),
+            object(),
+            [{'show': 'My Show', 'season': '01', 'content_type': 'tv'}],
+            'internal',
+            {'pi': {}, 'paths': {'jellyfin_shows': '/shows', 'jellyfin_movies': '/movies'}, 'options': {}},
+        )
+    finally:
+        telegram_bot._finish_long_running_operation("user:11")
+
+    assert tracker['run_blocking_used'] is True
+    assert tracker['copy_items_called'] is True
+    assert tracker['selected'][0]['show'] == 'My Show'
+    assert telegram_bot._active_bot_operation is None
+
+
+@pytest.mark.asyncio
+async def test_backup_command_uses_run_blocking(monkeypatch):
+    tracker = {}
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+            self.edits = []
+
+        async def reply_text(self, text, parse_mode=None):
+            self.replies.append((text, parse_mode))
+            return self
+
+        async def edit_text(self, text):
+            self.edits.append(text)
+
+    class FakeUser:
+        id = 21
+
+    class FakeUpdate:
+        effective_user = FakeUser()
+
+        def __init__(self):
+            self.message = FakeMessage()
+
+    class FakeContext:
+        bot_data = {
+            'config': {
+                'telegram': {'allowed_users': []},
+                'backup': {'enabled': True},
+            }
+        }
+
+    class FakeBackup:
+        def __init__(self, config):
+            tracker['backup_init'] = config
+
+        def create_backup(self, progress_callback=None):
+            tracker['create_backup_called'] = True
+            if progress_callback:
+                progress_callback('halfway')
+            return True, 'backup ok'
+
+    async def fake_run_blocking(func, *args, **kwargs):
+        tracker['run_blocking_used'] = True
+        return func()
+
+    import backup
+
+    monkeypatch.setattr(backup, 'SystemBackup', FakeBackup)
+    monkeypatch.setattr(telegram_bot, '_run_blocking', fake_run_blocking)
+
+    update = FakeUpdate()
+    await telegram_bot.backup_command(update, FakeContext())
+
+    assert tracker['run_blocking_used'] is True
+    assert tracker['create_backup_called'] is True
+    assert update.message.edits[-1] == "✅ backup ok\n\nNext backup due in 30 days."
+    assert telegram_bot._active_bot_operation is None

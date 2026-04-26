@@ -44,6 +44,8 @@ MODE_SELECTION, CONTENT_SELECTION, CONFIRMATION, COPYING = range(4)
 # Store user data and ideas
 user_data: Dict[int, dict] = {}
 ideas_data: List[dict] = []  # List of ideas with date, text, status
+_bot_operation_semaphore = asyncio.Semaphore(1)
+_active_bot_operation: Optional[dict] = None
 
 USER_DATA_FILE = "user_data.json"
 IDEAS_FILE = "ideas.json"
@@ -104,6 +106,55 @@ def is_authorized(user_id: int, allowed_users: List[int]) -> bool:
 async def _run_blocking(func, *args, **kwargs):
     """Run blocking work in the default executor."""
     return await async_helpers.async_call(func, *args, **kwargs)
+
+
+async def _begin_long_running_operation(owner: str, name: str) -> bool:
+    """Acquire the single long-running bot operation slot."""
+    global _active_bot_operation
+    if _bot_operation_semaphore.locked():
+        return False
+
+    await _bot_operation_semaphore.acquire()
+    _active_bot_operation = {"owner": owner, "name": name, "resource": None}
+    return True
+
+
+def _set_long_running_operation_resource(owner: str, resource) -> None:
+    """Attach a cancellable resource to the active long-running operation."""
+    if _active_bot_operation and _active_bot_operation.get("owner") == owner:
+        _active_bot_operation["resource"] = resource
+
+
+def _finish_long_running_operation(owner: str) -> None:
+    """Release the long-running bot operation slot for the current owner."""
+    global _active_bot_operation
+    if not _active_bot_operation or _active_bot_operation.get("owner") != owner:
+        return
+
+    _active_bot_operation = None
+    if _bot_operation_semaphore.locked():
+        _bot_operation_semaphore.release()
+
+
+def _cancel_long_running_operation(owner: str) -> str:
+    """Request cancellation for the owner's active operation when supported."""
+    active = _active_bot_operation
+    if not active or active.get("owner") != owner:
+        return "none"
+
+    resource = active.get("resource")
+    if resource is None or not hasattr(resource, "cancel"):
+        return "unsupported"
+
+    resource.cancel()
+    return "requested"
+
+
+def _long_running_operation_busy_text() -> str:
+    """Return a user-facing message for overlapping bot operations."""
+    if _active_bot_operation and _active_bot_operation.get("name"):
+        return f"⚠️ Another {_active_bot_operation['name']} operation is already running. Please wait for it to finish."
+    return "⚠️ Another long-running operation is already running. Please wait for it to finish."
 
 
 def _scan_download_items(pi_config: dict, downloads_path: str, tmdb_api_key: Optional[str]) -> Optional[List[dict]]:
@@ -830,15 +881,24 @@ async def proceed_copy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await query.answer()
     
     user_id = update.effective_user.id
+    operation_owner = f"user:{user_id}"
     selected = user_data[user_id]['selected']
     mode = user_data[user_id]['mode']
     config = user_data[user_id]['config']
-    
-    await query.edit_message_text(
-        f"🚀 Starting {mode.upper()} copy...\n"
-        f"Items: {len(selected)}\n"
-        "⏳ Connecting and preparing transfer..."
-    )
+
+    if not await _begin_long_running_operation(operation_owner, "copy"):
+        await query.answer(_long_running_operation_busy_text(), show_alert=True)
+        return CONFIRMATION
+
+    try:
+        await query.edit_message_text(
+            f"🚀 Starting {mode.upper()} copy...\n"
+            f"Items: {len(selected)}\n"
+            "⏳ Connecting and preparing transfer..."
+        )
+    except Exception:
+        _finish_long_running_operation(operation_owner)
+        raise
     
     # Run copy in background to not block
     asyncio.create_task(
@@ -853,6 +913,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """Run the actual copy process and send progress updates."""
     query = update.callback_query
     user_id = update.effective_user.id
+    operation_owner = f"user:{user_id}"
     
     # Get dry-run mode for this user
     dry_run = user_data[user_id].get('dry_run', config.get('options', {}).get('dry_run', False))
@@ -992,6 +1053,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 'local_destination': config['paths'].get('local_destination', './downloads')
             }
             copier = ExternalCopier(config['pi'], local_paths, copier_options)
+        _set_long_running_operation_resource(operation_owner, copier)
         
         # Create a simple console-like object for copier.
         # print() is called from an executor thread, so must use run_coroutine_threadsafe.
@@ -1019,10 +1081,9 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         console = TelegramConsole(query.message, _event_loop)
         
         # copy_items is synchronous/blocking (SSH + rsync I/O).
-        # Run it in a thread executor so the asyncio event loop stays free
+        # Run it via the shared async helper so the event loop stays free
         # to process progress message updates and other bot events.
-        success = await _event_loop.run_in_executor(
-            None,
+        success = await _run_blocking(
             lambda: copier.copy_items(selected, console, progress_callback=progress_callback)
         )
         
@@ -1064,6 +1125,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
             parse_mode='Markdown'
         )
     finally:
+        _finish_long_running_operation(operation_owner)
         # Clean up user data
         if user_id in user_data:
             del user_data[user_id]
@@ -1111,12 +1173,21 @@ async def proceed_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     
     user_id = update.effective_user.id
+    operation_owner = f"user:{user_id}"
     config = user_data[user_id]['config']
-    
-    await query.edit_message_text(
-        "🔧 Starting system updates...\n"
-        "⏳ Running apt update..."
-    )
+
+    if not await _begin_long_running_operation(operation_owner, "update"):
+        await query.answer(_long_running_operation_busy_text(), show_alert=True)
+        return CONFIRMATION
+
+    try:
+        await query.edit_message_text(
+            "🔧 Starting system updates...\n"
+            "⏳ Running apt update..."
+        )
+    except Exception:
+        _finish_long_running_operation(operation_owner)
+        raise
     
     # Run updates in background
     asyncio.create_task(
@@ -1130,8 +1201,10 @@ async def run_update_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """Run the actual update process."""
     query = update.callback_query
     user_id = update.effective_user.id
+    operation_owner = f"user:{user_id}"
     updater = SystemUpdater(config['pi'])
     event_loop = asyncio.get_running_loop()
+    _set_long_running_operation_resource(operation_owner, updater)
     
     class TelegramConsole:
         def __init__(self, message, loop):
@@ -1177,6 +1250,7 @@ async def run_update_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
             parse_mode='Markdown'
         )
     finally:
+        _finish_long_running_operation(operation_owner)
         if user_id in user_data:
             del user_data[user_id]
 
@@ -1198,9 +1272,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Close scanner if open
     if user_id in user_data and 'scanner' in user_data[user_id]:
         user_data[user_id]['scanner'].close()
+
+    cancel_state = _cancel_long_running_operation(f"user:{user_id}")
     
     # Show cancel confirmation
-    cancel_text = "❌ Operation cancelled."
+    if cancel_state == "requested":
+        cancel_text = "❌ Cancellation requested. Stopping the active operation..."
+    elif cancel_state == "unsupported":
+        cancel_text = "⚠️ The active operation cannot be interrupted and will continue running."
+    else:
+        cancel_text = "❌ Operation cancelled."
     if edit_func:
         await edit_func(cancel_text)
     elif message:
@@ -2013,6 +2094,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     config = context.bot_data.get('config')
     allowed_users = config.get('telegram', {}).get('allowed_users', [])
     user_id = update.effective_user.id
+    operation_owner = f"user:{user_id}"
     
     if not is_authorized(user_id, allowed_users):
         await update.message.reply_text("⛔ Unauthorized.")
@@ -2027,12 +2109,20 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode='Markdown'
         )
         return
+
+    if not await _begin_long_running_operation(operation_owner, "backup"):
+        await update.message.reply_text(_long_running_operation_busy_text())
+        return
     
     from backup import SystemBackup
     backup = SystemBackup(config)
     
-    # Send initial message
-    message = await update.message.reply_text("📦 Starting backup... This may take 15-30 minutes.")
+    try:
+        # Send initial message
+        message = await update.message.reply_text("📦 Starting backup... This may take 15-30 minutes.")
+    except Exception:
+        _finish_long_running_operation(operation_owner)
+        raise
     
     async def progress_callback(msg):
         try:
@@ -2040,22 +2130,26 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             pass  # Ignore edit errors
     
-    # Run backup in executor to not block
-    loop = asyncio.get_running_loop()
-    success, result_msg = await loop.run_in_executor(
-        None, 
-        lambda: backup.create_backup(lambda msg: asyncio.run_coroutine_threadsafe(progress_callback(msg), loop))
-    )
-    
-    if success:
-        await message.edit_text(f"✅ {result_msg}\n\nNext backup due in 30 days.")
+    try:
+        # Run backup via the shared async helper to keep the event loop responsive.
+        loop = asyncio.get_running_loop()
+        success, result_msg = await _run_blocking(
+            lambda: backup.create_backup(
+                lambda msg: asyncio.run_coroutine_threadsafe(progress_callback(msg), loop)
+            )
+        )
         
-        # Notify if configured
-        if user_data.get(user_id, {}).get('notifications', False):
-            # Could send additional notification
-            pass
-    else:
-        await message.edit_text(f"❌ {result_msg}")
+        if success:
+            await message.edit_text(f"✅ {result_msg}\n\nNext backup due in 30 days.")
+            
+            # Notify if configured
+            if user_data.get(user_id, {}).get('notifications', False):
+                # Could send additional notification
+                pass
+        else:
+            await message.edit_text(f"❌ {result_msg}")
+    finally:
+        _finish_long_running_operation(operation_owner)
 
 
 async def backupstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2212,7 +2306,19 @@ def main():
                 """Run monthly backup check in background."""
                 while True:
                     try:
-                        due, success, msg = await _run_blocking(_run_auto_backup_cycle, config)
+                        if not await _begin_long_running_operation("scheduler", "auto-backup"):
+                            logger.info(
+                                "Skipping auto-backup check because %s is already running.",
+                                _active_bot_operation.get("name") if _active_bot_operation else "another operation",
+                            )
+                            await asyncio.sleep(86400)
+                            continue
+
+                        try:
+                            due, success, msg = await _run_blocking(_run_auto_backup_cycle, config)
+                        finally:
+                            _finish_long_running_operation("scheduler")
+
                         if due:
                             logger.info("Monthly backup is due, starting auto-backup...")
                             if success:
