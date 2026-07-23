@@ -927,6 +927,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         'speed': '',
         'eta': '',
         'filename': '',
+        'item_name': '',
         'start_time': _time.time(),
         'completed': [],  # list of display names already done
         'ep_num': 0,
@@ -934,6 +935,15 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
     }
     total_items = len(selected)
     _event_loop = asyncio.get_running_loop()
+
+    def selection_name(item_num):
+        if not selected:
+            return f"Item {item_num}"
+        item = selected[min(max(item_num - 1, 0), len(selected) - 1)]
+        name = item['show']
+        if item.get('season'):
+            name += f" S{item['season']}"
+        return name
     
     async def update_progress_message():
         """Update the Telegram message with current progress."""
@@ -957,9 +967,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         bar = '█' * filled + '░' * (10 - filled)
         
         # Current item display name
-        item_name = selected[i - 1]['show'] if i > 0 else ''
-        if i > 0 and selected[i - 1].get('season'):
-            item_name += f" S{selected[i - 1]['season']}"
+        item_name = copy_state['item_name']
         
         elapsed = int(now - copy_state['start_time'])
         
@@ -982,7 +990,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         
         # Show current item in progress
         if i > 0:
-            cur_item = selected[i - 1]
+            cur_item = selected[min(i - 1, len(selected) - 1)] if selected else {}
             is_tv = cur_item.get('content_type') == 'tv'
             if is_tv and ep_total > 0:
                 lines.append(f"🔄 *{item_name}* — episode {ep_num}/{ep_total}")
@@ -1019,24 +1027,19 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         copy_state['filename'] = filename
         copy_state['ep_num'] = ep_num
         copy_state['ep_total'] = ep_total
+        current_name = selection_name(item_num)
+        copy_state['item_name'] = current_name
         
         # When moving to a new item, mark the previous one as completed
         if item_num > prev_idx and prev_idx > 0:
-            prev = selected[prev_idx - 1]
-            name = prev['show']
-            if prev.get('season'):
-                name += f" S{prev['season']}"
+            name = selection_name(prev_idx)
             if name not in copy_state['completed']:
                 copy_state['completed'].append(name)
         
         # Also mark as complete when percent hits 100 (last item)
         if percent >= 100:
-            cur = selected[item_num - 1]
-            name = cur['show']
-            if cur.get('season'):
-                name += f" S{cur['season']}"
-            if name not in copy_state['completed']:
-                copy_state['completed'].append(name)
+            if current_name not in copy_state['completed']:
+                copy_state['completed'].append(current_name)
         
         # Must use run_coroutine_threadsafe since this is called from a thread
         asyncio.run_coroutine_threadsafe(update_progress_message(), _event_loop)

@@ -436,6 +436,7 @@ async def test_run_copy_process_uses_run_blocking(monkeypatch):
         def copy_items(self, selected, console, progress_callback=None):
             tracker['copy_items_called'] = True
             tracker['selected'] = selected
+            progress_callback(2, 1, 100, 'episode.mkv')
             return True
 
     async def fake_run_blocking(func, *args, **kwargs):
@@ -463,6 +464,7 @@ async def test_run_copy_process_uses_run_blocking(monkeypatch):
     assert tracker['run_blocking_used'] is True
     assert tracker['copy_items_called'] is True
     assert tracker['selected'][0]['show'] == 'My Show'
+    assert not any('Error during copy' in text for text, _ in FakeUpdate.callback_query.message.texts)
     assert telegram_bot._active_bot_operation is None
 
 

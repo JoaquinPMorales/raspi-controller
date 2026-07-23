@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass
@@ -464,12 +465,15 @@ class RsyncCopier:
             return True
 
         expanded_items = []
-        for item in items:
+        original_total = len(items)
+        for group_num, item in enumerate(items, 1):
             source_items = item.get('items') or [item]
             for source_item in source_items:
                 expanded_item = dict(item)
                 expanded_item.update(source_item)
                 expanded_item['items'] = [source_item]
+                expanded_item['_progress_item_num'] = group_num
+                expanded_item['_progress_total'] = original_total
                 expanded_items.append(expanded_item)
         items = expanded_items
         
@@ -532,16 +536,28 @@ class RsyncCopier:
                 
                 # Track last progress percent to throttle callbacks
                 last_callback_percent = 0
+                last_callback_time = 0.0
                 
                 def _progress_wrapper(item_num, total, current_percent, filename, speed="", eta="", ep_num=0, ep_total=0):
-                    nonlocal last_callback_percent
-                    # Only call back on 10% increments or first/last
+                    nonlocal last_callback_percent, last_callback_time
+                    now = time.monotonic()
+                    # Throttle callbacks by progress or elapsed time
                     if progress_callback and (current_percent == 0 or current_percent >= 100 or 
-                                               current_percent - last_callback_percent >= 10):
+                                               current_percent - last_callback_percent >= 10 or
+                                               now - last_callback_time >= 3):
                         progress_callback(item_num, total, current_percent, filename or display_name, speed, eta, ep_num, ep_total)
                         last_callback_percent = current_percent
+                        last_callback_time = now
                 
-                success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper, item_num=i, total_items=len(items))
+                success = self._copy_single_item(
+                    item,
+                    console,
+                    progress,
+                    task_id,
+                    _progress_wrapper,
+                    item_num=item.get('_progress_item_num', i),
+                    total_items=item.get('_progress_total', len(items)),
+                )
                 
                 if success:
                     progress.update(overall_task, advance=1)
@@ -787,12 +803,15 @@ class ExternalCopier:
             return True
 
         expanded_items = []
-        for item in items:
+        original_total = len(items)
+        for group_num, item in enumerate(items, 1):
             source_items = item.get('items') or [item]
             for source_item in source_items:
                 expanded_item = dict(item)
                 expanded_item.update(source_item)
                 expanded_item['items'] = [source_item]
+                expanded_item['_progress_item_num'] = group_num
+                expanded_item['_progress_total'] = original_total
                 expanded_items.append(expanded_item)
         items = expanded_items
         
@@ -859,15 +878,21 @@ class ExternalCopier:
                 console.print(f"\n[bold]{i}/{len(items)}: {display_name}[/bold]")
 
                 last_callback_percent = 0
+                last_callback_time = 0.0
+                progress_item_num = item.get('_progress_item_num', i)
+                progress_total = item.get('_progress_total', total_items)
 
                 def _progress_wrapper(current_percent, filename="", speed="", eta=""):
-                    nonlocal last_callback_percent
+                    nonlocal last_callback_percent, last_callback_time
+                    now = time.monotonic()
                     if progress_callback and (
                         current_percent == 0 or current_percent >= 100 or
-                        current_percent - last_callback_percent >= 10
+                        current_percent - last_callback_percent >= 10 or
+                        now - last_callback_time >= 3
                     ):
-                        progress_callback(i, total_items, current_percent, filename or display_name, speed, eta, 0, 0)
+                        progress_callback(progress_item_num, progress_total, current_percent, filename or display_name, speed, eta, 0, 0)
                         last_callback_percent = current_percent
+                        last_callback_time = now
 
                 success = self._copy_single_item(item, console, progress, task_id, _progress_wrapper)
 
