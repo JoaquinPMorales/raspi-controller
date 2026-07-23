@@ -78,3 +78,38 @@ def test_copy_items_expands_separately_downloaded_sources(monkeypatch):
 
     assert copier.copy_items([item], Console()) is True
     assert copied_paths == ['/downloads/part-1', '/downloads/part-2']
+
+
+def test_local_internal_copy_skips_ssh(monkeypatch):
+    copier = RsyncCopier(
+        {'host': '192.168.1.50', 'user': 'pi'},
+        {'jellyfin_shows': '/mnt/media/Shows'},
+        {'local_internal': True},
+    )
+    captured = {}
+
+    monkeypatch.setattr('copier.os.makedirs', lambda *args, **kwargs: None)
+
+    def fake_rsync(self, source, dest, console, progress, task_id, display_name,
+                   progress_callback=None, source_is_dir=True, item_num=1, total_items=1):
+        captured.update(source=source, dest=dest)
+        return True
+
+    monkeypatch.setattr(RsyncCopier, '_rsync_local', fake_rsync)
+
+    assert copier._copy_single_item(
+        {
+            'path': '/mnt/storage/downloads/Silo S03',
+            'show': 'Silo',
+            'season': '03',
+            'content_type': 'tv',
+            'type': 'folder',
+        },
+        None,
+        None,
+        1,
+    ) is True
+    assert captured == {
+        'source': '/mnt/storage/downloads/Silo S03',
+        'dest': '/mnt/media/Shows/Silo/Season 03',
+    }

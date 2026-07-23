@@ -68,6 +68,9 @@ jellyfin:
 
 tmdb:
   api_key: "your-tmdb-api-key"  # Optional, fetches year for better matching
+
+telegram:
+  internal_local: true           # Bot runs on Pi; internal copies use local rsync
 ```
 
 ## Configuration
@@ -159,6 +162,26 @@ When you start the script, you'll be prompted to select a mode:
 - Downloads files from Raspberry Pi to your local machine
 - Saves to `./downloads/TV/` and `./downloads/Movies/` by default
 - Best for: Watching content offline or backing up
+
+### External Mode Requirements
+
+External mode runs `rsync` on the machine running the script and pulls files from the Pi. Before using it:
+
+- Install `rsync` and `ssh` on the local machine.
+- Install `rsync` on the Raspberry Pi.
+- Configure `pi.key_path` with a readable private key, or install `sshpass` when using `pi.password`.
+- Add the Pi's verified SSH host key to the runtime user's `~/.ssh/known_hosts`:
+  ```bash
+  ssh -i ~/.ssh/id_rsa <username>@<pi-ip-address>
+  ```
+- Ensure `paths.local_destination` exists or its parent is writable.
+- Ensure local destination has enough free space.
+
+SSH host-key verification is strict. `pi.key_path` authenticates the client; `known_hosts` verifies the Pi. Verify the fingerprint before accepting a new host key.
+
+The destination is local to the process running the bot or script. For a real Pi-to-laptop Telegram copy, run the bot on the laptop or mount a laptop destination on the Pi. A bot running on the Pi writes external copies to the Pi's `local_destination`.
+
+Telegram bot internal copies use local rsync by default because bot deployment runs on the Pi. Set `telegram.internal_local: false` only when bot runs on another machine and must use SSH for internal copies.
 
 ### Maintenance Mode (Update Pi) Prerequisites
 

@@ -319,6 +319,30 @@ class RsyncCopier:
         
         # Strip only trailing slashes — whitespace is valid in Linux filenames
         source_path = source_path.rstrip('/')
+        dest_path = self._get_destination_path(item).rstrip('/')
+
+        if (
+            self.options_config.get('local_internal', False)
+            and self._is_local_path(source_path)
+            and self._is_local_path(dest_path)
+        ):
+            try:
+                os.makedirs(dest_path, exist_ok=True)
+            except Exception as e:
+                console.print(f"[red]Failed to create destination directory: {e}[/red]")
+                return False
+            return self._rsync_local(
+                source_path,
+                dest_path,
+                console,
+                progress,
+                task_id,
+                display_name,
+                progress_callback,
+                source_is_dir=source_is_dir,
+                item_num=item_num,
+                total_items=total_items,
+            )
 
         try:
             # Connect to execute rsync

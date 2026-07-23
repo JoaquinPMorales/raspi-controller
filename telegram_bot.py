@@ -1047,6 +1047,7 @@ async def run_copy_process(update: Update, context: ContextTypes.DEFAULT_TYPE,
         copier_options['dry_run'] = dry_run
         
         if mode == 'internal':
+            copier_options['local_internal'] = config.get('telegram', {}).get('internal_local', True)
             copier = RsyncCopier(config['pi'], config['paths'], copier_options)
         else:
             local_paths = {
