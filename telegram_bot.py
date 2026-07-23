@@ -1445,13 +1445,19 @@ async def reboot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def reboot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle reboot confirmation/cancel."""
     query = update.callback_query
+
+    config = context.bot_data.get('config')
+    allowed_users = config.get('telegram', {}).get('allowed_users', [])
+    if not is_authorized(update.effective_user.id, allowed_users):
+        await query.answer("Unauthorized.", show_alert=True)
+        return
+
     await query.answer()
     
     if query.data == 'reboot_confirm':
         await query.edit_message_text("🔄 Rebooting Pi...")
 
         try:
-            config = context.bot_data.get('config')
             await _run_blocking(_reboot_pi, config['pi'])
             await query.edit_message_text("✅ Reboot command sent.\nThe Pi will be offline for ~30-60 seconds.")
         except Exception as e:
@@ -1800,13 +1806,18 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     args = context.args or []
-    fix_mode = args and args[0].lower() == 'fix'
+    fix_mode = bool(args and args[0].lower() == 'fix')
+    confirmed = bool(fix_mode and len(args) > 1 and args[1].lower() == 'confirm')
+    search_args = args[2:] if confirmed else args[1:] if fix_mode else args
+    if fix_mode and not confirmed:
+        await update.message.reply_text("⚠️ This moves media folders. Confirm with `/group fix confirm [Show Name]`.")
+        return
     
     if fix_mode:
-        search_term = ' '.join(args[1:]) if len(args) > 1 else None
+        search_term = ' '.join(search_args) if search_args else None
         progress_msg = await update.message.reply_text("🔧 Analyzing TV shows for reorganization...")
     else:
-        search_term = ' '.join(args) if args else None
+        search_term = ' '.join(search_args) if search_args else None
         await update.message.reply_text("🔍 Scanning TV Shows folder...")
     
     import os
@@ -1888,7 +1899,7 @@ async def group_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             for f in sorted(folders):
                 lines.append(f"  📁 `{f}`")
         
-        lines.append("\n\n💡 Use `/group fix [Show Name]` to reorganize automatically.")
+        lines.append("\n\n💡 Use `/group fix confirm [Show Name]` to reorganize automatically.")
         
         text = '\n'.join(lines)
         if len(text) > 4000:

@@ -48,6 +48,27 @@ async def test_async_refresh_jellyfin_library_uses_ssh_fallback(monkeypatch):
     assert ok is True
 
 
+def test_refresh_via_ssh_rejects_failed_http_status():
+    class Channel:
+        def recv_exit_status(self):
+            return 0
+
+    class Stdout:
+        channel = Channel()
+
+        def read(self):
+            return b'500'
+
+    class SSH:
+        def exec_command(self, command):
+            return None, Stdout(), None
+
+    class Scanner:
+        ssh = SSH()
+
+    assert jellyfin._refresh_via_ssh(Scanner(), 'pi', 8096) is False
+
+
 @pytest.mark.asyncio
 async def test_refresh_jellyfin_for_bot_async_prefers_async_api(monkeypatch):
     tracker = {}

@@ -74,7 +74,7 @@ class RsyncCopier:
                 return value
         raise ValueError(f"Missing destination path configuration; expected one of: {', '.join(keys)}")
     
-    def _build_rsync_args(self, source: str, destination: str, source_is_dir: bool = True) -> list:
+    def _build_rsync_args(self, source: str, destination: str, source_is_dir: bool = True, rsync_bin: Optional[str] = None) -> list:
         """Build rsync argument list (no shell quoting needed)."""
         dry_run = self.options_config.get('dry_run', False)
         bwlimit = self.options_config.get('bwlimit')
@@ -103,14 +103,12 @@ class RsyncCopier:
         if src.rstrip('/').lower().endswith(tuple(self._VIDEO_EXTENSIONS)):
             src = src.rstrip('/')
         
-        return [_resolve_rsync_bin()] + flags + [src, dst]
+        return [rsync_bin or _resolve_rsync_bin()] + flags + [src, dst]
     
     def _build_rsync_command(self, source: str, destination: str, source_is_dir: bool = True) -> str:
         """Build rsync command string (used for SSH remote execution)."""
-        args = self._build_rsync_args(source, destination, source_is_dir)
-        # Shell-quote paths (last two elements are source and dest)
-        quoted = args[:-2] + [f"'{args[-2]}'", f"'{args[-1]}'"] 
-        return ' '.join(quoted)
+        args = self._build_rsync_args(source, destination, source_is_dir, rsync_bin='rsync')
+        return ' '.join(shlex.quote(arg) for arg in args)
     
     def _parse_rsync_progress(self, line: str) -> Optional[Dict]:
         """
@@ -132,7 +130,7 @@ class RsyncCopier:
         
         return None
     
-    def _find_existing_series_folder(self, dest_base: str, show_name: str) -> Optional[str]:
+    def _find_existing_series_folder(self, dest_base: str, show_name: str, entry_names=None) -> Optional[str]:
         """
         Check if a series folder already exists in the destination.
         Returns the existing folder name if found, None otherwise.
@@ -144,22 +142,34 @@ class RsyncCopier:
         
         target_normalized = normalize(show_name)
         
-        # Check if destination exists locally
-        if os.path.isdir(dest_base):
+        if entry_names is None:
+            if not os.path.isdir(dest_base):
+                return None
             try:
-                for entry in os.scandir(dest_base):
-                    if entry.is_dir():
-                        entry_name = entry.name
-                        # Remove year suffix for comparison: "Name (2020)" -> "Name"
-                        name_without_year = re.sub(r'\s*\(\d{4}\)\s*$', '', entry_name)
-                        if normalize(name_without_year) == target_normalized:
-                            return entry_name  # Return exact existing folder name
+                entry_names = [entry.name for entry in os.scandir(dest_base) if entry.is_dir()]
             except Exception:
-                pass
+                return None
+
+        for entry_name in entry_names:
+            # Remove year suffix for comparison: "Name (2020)" -> "Name"
+            name_without_year = re.sub(r'\s*\(\d{4}\)\s*$', '', entry_name)
+            if normalize(name_without_year) == target_normalized:
+                return entry_name
         
         return None
+
+    def _find_existing_series_folder_remote(self, ssh, dest_base: str, show_name: str) -> Optional[str]:
+        command = f"find {shlex.quote(dest_base)} -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null"
+        try:
+            _, stdout, _ = ssh.exec_command(command)
+            output = stdout.read().decode('utf-8', errors='ignore')
+            if stdout.channel.recv_exit_status() != 0:
+                return None
+            return self._find_existing_series_folder(dest_base, show_name, output.splitlines())
+        except Exception:
+            return None
     
-    def _get_destination_path(self, item: Dict) -> str:
+    def _get_destination_path(self, item: Dict, existing_folder: Optional[str] = None) -> str:
         """Determine the correct destination path based on content type."""
         content_type = item.get('content_type', 'movie')
         show_name = item['show']
@@ -169,7 +179,8 @@ class RsyncCopier:
         if content_type == 'tv':
             dest_base = self._require_destination_base('jellyfin_shows', 'jellyfin_tv')
             # Check for existing series folder first
-            existing_folder = self._find_existing_series_folder(dest_base, show_name)
+            if existing_folder is None:
+                existing_folder = self._find_existing_series_folder(dest_base, show_name)
             if existing_folder:
                 folder_name = existing_folder
             else:
@@ -300,9 +311,6 @@ class RsyncCopier:
         content_type = item.get('content_type', 'movie')
         source_is_dir = item.get('type', 'folder') == 'folder'
         
-        # Build destination path based on content type
-        dest_path = self._get_destination_path(item)
-        
         # Build display name for progress
         if content_type == 'tv' and season:
             display_name = f"{show_name} S{season}"
@@ -311,29 +319,12 @@ class RsyncCopier:
         
         # Strip only trailing slashes — whitespace is valid in Linux filenames
         source_path = source_path.rstrip('/')
-        dest_path = dest_path.rstrip('/')
-        
-        # If both paths are local, use subprocess directly (much faster than SSH)
-        if self._is_local_path(source_path) and self._is_local_path(dest_path):
-            # Ensure destination directory exists locally
-            try:
-                os.makedirs(dest_path, exist_ok=True)
-            except Exception as e:
-                console.print(f"[red]Failed to create destination directory: {e}[/red]")
-                return False
-            # Use fast local rsync without SSH overhead
-            return self._rsync_local(source_path, dest_path, console, progress, task_id, 
-                                     display_name, progress_callback, source_is_dir=source_is_dir,
-                                     item_num=item_num, total_items=total_items)
-        
-        # Remote copy via SSH
-        # Ensure destination directory exists
-        mkdir_cmd = f"mkdir -p '{dest_path}'"
-        
+
         try:
             # Connect to execute rsync
             ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.load_system_host_keys()
+            ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
             
             connect_kwargs = {
                 'hostname': self.pi_config['host'],
@@ -353,6 +344,14 @@ class RsyncCopier:
                 connect_kwargs['password'] = password
             
             ssh.connect(**connect_kwargs)
+
+            existing_folder = None
+            if content_type == 'tv':
+                dest_base = self._require_destination_base('jellyfin_shows', 'jellyfin_tv')
+                existing_folder = self._find_existing_series_folder_remote(ssh, dest_base, show_name)
+            dest_path = self._get_destination_path(item, existing_folder)
+            dest_path = dest_path.rstrip('/')
+            mkdir_cmd = f"mkdir -p {shlex.quote(dest_path)}"
             
             # Create destination directory and WAIT for it to complete
             _, mkdir_stdout, mkdir_stderr = ssh.exec_command(mkdir_cmd)
@@ -439,6 +438,16 @@ class RsyncCopier:
         if not items:
             console.print("[yellow]No items to copy.[/yellow]")
             return True
+
+        expanded_items = []
+        for item in items:
+            source_items = item.get('items') or [item]
+            for source_item in source_items:
+                expanded_item = dict(item)
+                expanded_item.update(source_item)
+                expanded_item['items'] = [source_item]
+                expanded_items.append(expanded_item)
+        items = expanded_items
         
         dry_run = self.options_config.get('dry_run', False)
         mode_str = "DRY RUN" if dry_run else "COPY"
@@ -567,8 +576,7 @@ class ExternalCopier:
         """Build the rsync SSH transport command and environment."""
         ssh_args = [
             'ssh',
-            '-o', 'StrictHostKeyChecking=no',
-            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'StrictHostKeyChecking=yes',
             '-p', str(self.pi_config.get('port', 22)),
         ]
 
@@ -753,6 +761,16 @@ class ExternalCopier:
         if not items:
             console.print("[yellow]No items to copy.[/yellow]")
             return True
+
+        expanded_items = []
+        for item in items:
+            source_items = item.get('items') or [item]
+            for source_item in source_items:
+                expanded_item = dict(item)
+                expanded_item.update(source_item)
+                expanded_item['items'] = [source_item]
+                expanded_items.append(expanded_item)
+        items = expanded_items
         
         dry_run = self.options_config.get('dry_run', False)
         mode_str = "DRY RUN" if dry_run else "COPY"

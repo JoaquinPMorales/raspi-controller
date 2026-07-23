@@ -68,3 +68,31 @@ def test_remove_from_cloud_logs_failure(tmp_path, monkeypatch, caplog):
         backup.remove_from_cloud('old-backup.img.gz')
 
     assert any('permission denied' in message for message in caplog.messages)
+
+
+def test_full_backup_preserves_old_file_when_cloud_upload_fails(tmp_path, monkeypatch):
+    backup = make_backup(tmp_path, {'cloud_enabled': True})
+    old_file = tmp_path / 'raspi-backup-20240101_000000.img.gz'
+    old_file.write_bytes(b'old')
+    backup.get_backup_filename = lambda: 'raspi-backup-20240102_000000.img.gz'
+    removed = []
+
+    class Result:
+        returncode = 0
+        stderr = ''
+
+    def fake_run(*args, **kwargs):
+        (tmp_path / 'raspi-backup-20240102_000000.img.gz').write_bytes(b'new')
+        return Result()
+
+    monkeypatch.setattr('backup.subprocess.run', fake_run)
+    monkeypatch.setattr(backup, 'upload_to_cloud', lambda *args: (False, 'upload failed'))
+    monkeypatch.setattr(backup, '_remove_previous_backup', lambda path: removed.append(path))
+    monkeypatch.setattr(backup, '_notify', lambda text: None)
+
+    ok, _ = backup._create_full_image()
+
+    assert ok is True
+    assert old_file.exists()
+    assert removed == []
+    assert backup.load_status()['cloud_sync'] is False

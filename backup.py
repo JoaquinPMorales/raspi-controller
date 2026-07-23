@@ -155,7 +155,7 @@ class SystemBackup:
 
         try:
             cmd = (
-                f"sudo dd if={shlex.quote(self.source_device)} bs=4M status=progress "
+                f"set -o pipefail; sudo dd if={shlex.quote(self.source_device)} bs=4M status=progress "
                 f"| gzip > {shlex.quote(backup_file)}"
             )
             if progress_callback:
@@ -167,7 +167,8 @@ class SystemBackup:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=7200  # 2 hour timeout
+                timeout=7200,  # 2 hour timeout
+                executable='/bin/bash',
             )
 
             if result.returncode != 0:
@@ -181,6 +182,7 @@ class SystemBackup:
             if progress_callback:
                 progress_callback(f"Backup created: {size_mb:.1f} MB")
 
+            cloud_success = not self.cloud_enabled
             if self.cloud_enabled:
                 if progress_callback:
                     progress_callback("Uploading to cloud storage...")
@@ -189,7 +191,7 @@ class SystemBackup:
                 if not cloud_success:
                     logger.warning(f"Cloud upload failed: {cloud_msg}")
 
-            if old_backup and old_backup != backup_file:
+            if cloud_success and old_backup and old_backup != backup_file:
                 if progress_callback:
                     progress_callback("Removing old backup...")
                 self._remove_previous_backup(old_backup)
@@ -199,7 +201,7 @@ class SystemBackup:
             status['last_success'] = datetime.now().isoformat()
             status['latest_file'] = os.path.basename(backup_file)
             status['latest_size'] = size
-            status['cloud_sync'] = self.cloud_enabled
+            status['cloud_sync'] = cloud_success
             self.save_status(status)
 
             self._notify(f"Backup completed: {os.path.basename(backup_file)} ({size_mb:.1f} MB)")
@@ -230,6 +232,7 @@ class SystemBackup:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         snapshot_name = f"snapshot-{timestamp}"
         snapshot_path = os.path.join(snapshots_root, snapshot_name)
+        old_backup = self.get_latest_backup()
 
         # Find latest snapshot for link-dest
         latest = None
@@ -269,6 +272,7 @@ class SystemBackup:
 
             size = os.path.getsize(backup_file)
 
+            cloud_success = not self.cloud_enabled
             if self.cloud_enabled:
                 if progress_callback:
                     progress_callback("Uploading to cloud storage...")
@@ -277,8 +281,7 @@ class SystemBackup:
                     logger.warning(f"Cloud upload failed: {cloud_msg}")
 
             # Clean up old tar backup files
-            old_backup = self.get_latest_backup()
-            if old_backup and os.path.basename(old_backup) != os.path.basename(backup_file):
+            if cloud_success and old_backup and os.path.basename(old_backup) != os.path.basename(backup_file):
                 self._remove_previous_backup(old_backup)
 
             status = self.load_status()
@@ -286,7 +289,7 @@ class SystemBackup:
             status['last_success'] = datetime.now().isoformat()
             status['latest_file'] = os.path.basename(backup_file)
             status['latest_size'] = size
-            status['cloud_sync'] = self.cloud_enabled
+            status['cloud_sync'] = cloud_success
             self.save_status(status)
 
             self._notify(f"Snapshot completed: {os.path.basename(backup_file)} ({size/1024/1024:.1f} MB)")

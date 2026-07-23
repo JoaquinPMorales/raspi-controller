@@ -3,6 +3,7 @@ Jellyfin API module for refreshing the media library.
 """
 
 import asyncio
+import shlex
 from typing import Optional
 
 import httpx
@@ -87,19 +88,13 @@ def _refresh_via_ssh(scanner, host: str, port: int) -> bool:
     try:
         # Try using curl to trigger library refresh (no API key required for local access)
         # This assumes the Jellyfin server allows local connections without auth
-        curl_cmd = f'curl -s -o /dev/null -w "%{{http_code}}" -X POST http://{host}:{port}/Library/Refresh 2>/dev/null || echo "000"'
+        url = f"http://{host}:{port}/Library/Refresh"
+        curl_cmd = f'curl -s -o /dev/null -w "%{{http_code}}" -X POST {shlex.quote(url)}'
         
         stdin, stdout, stderr = scanner.ssh.exec_command(curl_cmd)
         exit_code = stdout.channel.recv_exit_status()
-        
-        # Also try to restart jellyfin service as fallback (this triggers rescan)
-        if exit_code != 0:
-            # Alternative: send USR1 signal to jellyfin or restart service
-            restart_cmd = "sudo systemctl restart jellyfin 2>/dev/null || true"
-            scanner.ssh.exec_command(restart_cmd)
-            return True  # Assume it worked
-        
-        return True
+        status_code = stdout.read().decode().strip()
+        return exit_code == 0 and status_code in ('200', '204')
         
     except Exception as e:
         print(f"SSH-based refresh failed: {e}")

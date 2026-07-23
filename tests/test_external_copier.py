@@ -69,6 +69,16 @@ def test_build_rsync_transport_uses_sshpass_for_password_auth(tmp_path, monkeypa
     assert env['SSHPASS'] == 'secret'
 
 
+def test_build_rsync_transport_requires_known_host(tmp_path):
+    copier = make_copier(tmp_path, use_key=True)
+
+    transport, _ = copier._build_rsync_transport()
+
+    assert "StrictHostKeyChecking=yes" in transport
+    assert "StrictHostKeyChecking=no" not in transport
+    assert "UserKnownHostsFile=/dev/null" not in transport
+
+
 def test_resolve_rsync_bin_uses_path_lookup(monkeypatch):
     monkeypatch.delenv('RSYNC_BIN', raising=False)
     monkeypatch.setattr(shutil, 'which', lambda name: '/opt/homebrew/bin/rsync' if name == 'rsync' else None)

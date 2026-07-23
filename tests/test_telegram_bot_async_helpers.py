@@ -211,6 +211,37 @@ def test_reboot_pi_writes_sudo_password(monkeypatch):
     assert tracker['closed'] is True
 
 
+@pytest.mark.asyncio
+async def test_reboot_callback_rejects_unauthorized_user(monkeypatch):
+    class FakeQuery:
+        data = 'reboot_confirm'
+
+        def __init__(self):
+            self.answers = []
+
+        async def answer(self, text=None, show_alert=False):
+            self.answers.append((text, show_alert))
+
+    class User:
+        id = 99
+
+    class Update:
+        effective_user = User()
+
+        def __init__(self):
+            self.callback_query = FakeQuery()
+
+    class Context:
+        bot_data = {'config': {'telegram': {'allowed_users': [1]}, 'pi': {}}}
+
+    monkeypatch.setattr(telegram_bot, '_reboot_pi', lambda config: (_ for _ in ()).throw(AssertionError()))
+    update = Update()
+
+    await telegram_bot.reboot_callback(update, Context())
+
+    assert update.callback_query.answers == [('Unauthorized.', True)]
+
+
 def test_search_downloads_returns_results(monkeypatch):
     outputs = iter([
         'ok',
